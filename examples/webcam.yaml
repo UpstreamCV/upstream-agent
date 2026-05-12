@@ -1,0 +1,29 @@
+# upstream-agent — example config for a local USB or built-in webcam.
+#
+# Copy this file to ~/.upstream/config.yaml (or pass it via --config /path)
+# and replace YOUR_API_TOKEN_HERE with your real token.
+#
+# DO NOT commit your filled-in config to any git repo, public or private.
+
+api:
+  base_url: "https://api.upstream.ai"
+  token: "YOUR_API_TOKEN_HERE"
+
+camera:
+  name: "Front Door"
+  source_type: "webcam"
+  # Integer device index. 0 is usually the first/built-in camera.
+  source: 0
+  requested_width: 1280
+  requested_height: 720
+  requested_fps: 30
+
+stream:
+  # "low" prioritises latency, "quality" prioritises image fidelity,
+  # "balanced" is a reasonable default for most setups.
+  latency_mode: "balanced"
+  buffer_ms: 500
+
+logging:
+  # debug | info | warning | error
+  level: "info"

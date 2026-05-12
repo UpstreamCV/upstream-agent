@@ -1,0 +1,28 @@
+# upstream-agent — example config for a network camera over RTSP.
+#
+# Copy this file to ~/.upstream/config.yaml (or pass it via --config /path)
+# and replace the placeholders with your real values.
+#
+# DO NOT commit your filled-in config to any git repo, public or private.
+# The RTSP URL below often contains a username and password in plaintext.
+
+api:
+  base_url: "https://api.upstream.ai"
+  token: "YOUR_API_TOKEN_HERE"
+
+camera:
+  name: "Loading Dock"
+  source_type: "rtsp"
+  # Full rtsp:// URL of your camera's stream. Many cameras expose multiple
+  # streams (main and sub); pick the one you want to ingest.
+  source: "rtsp://USER:PASS@CAMERA_HOST:554/stream1"
+  requested_width: 1920
+  requested_height: 1080
+  requested_fps: 15
+
+stream:
+  latency_mode: "balanced"
+  buffer_ms: 750
+
+logging:
+  level: "info"
