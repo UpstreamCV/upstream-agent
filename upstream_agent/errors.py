@@ -18,3 +18,23 @@ class ConfigError(UpstreamError):
 
 class StateError(UpstreamError):
     """Raised when the local agent state file cannot be loaded or written."""
+
+
+class CameraError(UpstreamError):
+    """Base class for camera-related failures."""
+
+
+class CameraOpenError(CameraError):
+    """Raised when a camera device cannot be opened."""
+
+
+class CameraReadError(CameraError):
+    """Raised when reading a frame from an opened camera fails."""
+
+
+class UnsupportedCameraSourceError(CameraError):
+    """Raised when a configured ``source_type`` is not implemented in this build."""
+
+
+class CameraDependencyMissingError(CameraError):
+    """Raised when a required camera system library (e.g. OpenCV) is not installed."""

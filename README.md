@@ -5,9 +5,9 @@ machine, reads a camera feed, asks the UpStream API for permission/config,
 and streams video securely to the UpStream streaming server.
 
 This README reflects the **current shape** of the project. The agent is
-under active development; this milestone provides the package skeleton and
-local config/state/logging machinery. Camera capture, API registration,
-encoding, and streaming will land in later milestones.
+under active development. Today it can be configured locally and probe
+a webcam (open, read one frame, report resolution and FPS, release).
+API registration, encoding, and streaming will land in later milestones.
 
 ## Requirements
 
@@ -40,7 +40,43 @@ upstream init
 
 # 3. View local agent and config status (token is always redacted).
 upstream status
+
+# 4. Verify the configured webcam is accessible.
+upstream check --camera
 ```
+
+### Verifying camera access
+
+`upstream check --camera` opens the configured camera, reads one
+frame, prints the actual resolution and FPS, and releases the device.
+It runs entirely locally — no API call, no video upload — so it works
+even before you have a real API token. A placeholder token is fine.
+
+Expected output on success:
+
+```
+Camera opened successfully
+Resolution: 1280x720
+FPS: 30
+```
+
+If the device negotiates different parameters than you asked for in
+the config, a note is appended:
+
+```
+Note: requested 1920x1080 @ 60, device negotiated 1280x720 @ 30.
+```
+
+On failure the command exits non-zero with an actionable message,
+e.g.:
+
+```
+Error: Could not open webcam at index 0. Check that the camera is
+connected, not already in use, and that the source index in your
+config is correct.
+```
+
+See `docs/troubleshooting.md` for the full list of camera diagnostics.
 
 ## Configuration
 
@@ -93,10 +129,13 @@ The agent stores everything under `~/.upstream/`:
 
 ## Project status
 
-- **Milestone 1 (current): package skeleton.** CLI, config, state, logging,
+- **Milestone 1: package skeleton.** CLI, config, state, logging,
   token redaction, tests, docs.
-- Milestone 2+: camera sources, frame buffer, FFmpeg encoder, SRT transport,
-  API registration, heartbeat, supervisor, diagnostics.
+- **Milestone 2 (current): camera check.** `VideoSource` ABC,
+  `WebcamSource`, `upstream check --camera`.
+- Milestone 3+: API registration, frame buffer, FFmpeg encoder, SRT
+  transport, heartbeat, supervisor, additional source types and
+  diagnostics.
 
 See `docs/architecture.md` for the planned end-to-end flow.
 

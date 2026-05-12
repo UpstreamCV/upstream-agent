@@ -1,11 +1,14 @@
 """The ``upstream`` CLI.
 
-Two subcommands today:
+Three subcommands today:
 
 * ``upstream init`` — write a default config template to
   ``~/.upstream/config.yaml`` (or a path supplied via ``--config``).
 * ``upstream status`` — show the current config and local state, with
   the API token always displayed as ``****<last4>``.
+* ``upstream check --camera`` — local camera probe. Opens the
+  configured webcam, reads one frame, reports actual resolution/FPS,
+  and releases the device. Makes no API call.
 
 ``--version`` prints the package version and exits.
 
@@ -26,6 +29,7 @@ from upstream_agent.config import (
     resolve_config_path,
     write_default_config,
 )
+from upstream_agent.diagnostics.camera import CameraCheckResult, run_camera_check
 from upstream_agent.errors import UpstreamError
 from upstream_agent.logging_setup import redact_token, setup_logging
 from upstream_agent.state import default_state_path, load_state
@@ -163,3 +167,86 @@ def status_cmd(
     typer.echo(f"  agent_id:       {state.agent_id or '<not registered>'}")
     typer.echo(f"  device_id:      {state.device_id}")
     typer.echo(f"  last_camera_id: {state.last_camera_id or '<none>'}")
+
+
+def _format_fps(fps: float) -> str:
+    if fps == 0.0:
+        return "unknown"
+    if fps.is_integer():
+        return str(int(fps))
+    return f"{fps:.2f}"
+
+
+def _print_camera_check_success(result: CameraCheckResult) -> None:
+    info = result.info
+    assert info is not None  # success implies info is populated
+
+    typer.echo("Camera opened successfully")
+    typer.echo(f"Resolution: {info.width}x{info.height}")
+    typer.echo(f"FPS: {_format_fps(info.fps)}")
+
+    requested_fps_mismatch = info.fps != 0.0 and int(info.fps) != result.requested_fps
+    if (info.width, info.height) != (
+        result.requested_width,
+        result.requested_height,
+    ) or requested_fps_mismatch:
+        typer.echo("")
+        typer.echo(
+            f"Note: requested {result.requested_width}x{result.requested_height} "
+            f"@ {result.requested_fps}, device negotiated "
+            f"{info.width}x{info.height} @ {_format_fps(info.fps)}."
+        )
+
+
+@app.command("check")
+def check_cmd(
+    camera: bool = typer.Option(
+        False,
+        "--camera",
+        help="Probe the configured camera (open, read one frame, release).",
+    ),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Override the config file path (default: ~/.upstream/config.yaml).",
+    ),
+) -> None:
+    """Run local diagnostics. Currently supports ``--camera``."""
+
+    if not camera:
+        typer.echo(
+            "Specify what to check, e.g. `upstream check --camera`. "
+            "See `upstream check --help` for options.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    config_path = resolve_config_path(config)
+    if not config_path.exists():
+        typer.echo(f"No config found at {config_path}.", err=True)
+        typer.echo("Run 'upstream init' to create one.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        cfg = load_config(config_path, allow_placeholder=True)
+    except UpstreamError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    sensitive = (
+        {cfg.api.token}
+        if cfg.api.token and not cfg.api.is_placeholder_token
+        else set()
+    )
+    setup_logging(
+        level=cfg.logging.level,
+        log_dir=_default_log_dir(),
+        sensitive_values=sensitive,
+    )
+
+    result = run_camera_check(cfg.camera)
+    if not result.success:
+        typer.echo(f"Error: {result.error}", err=True)
+        raise typer.Exit(code=1)
+
+    _print_camera_check_success(result)
