@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from upstream_agent.errors import ConfigError
 
@@ -37,15 +37,9 @@ class ApiConfig(BaseModel):
     base_url: str = Field(..., min_length=1)
     token: str = Field(..., min_length=1)
 
-    @field_validator("token")
-    @classmethod
-    def _reject_placeholder(cls, value: str) -> str:
-        if value.strip() == PLACEHOLDER_TOKEN:
-            raise ValueError(
-                "api.token is still set to the placeholder. "
-                "Replace YOUR_API_TOKEN_HERE with your real token."
-            )
-        return value
+    @property
+    def is_placeholder_token(self) -> bool:
+        return self.token.strip() == PLACEHOLDER_TOKEN
 
 
 class CameraConfig(BaseModel):
@@ -111,19 +105,25 @@ def resolve_config_path(explicit: Path | None = None) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def load_config(path: Path | None = None) -> Config:
+def load_config(path: Path | None = None, allow_placeholder: bool = False) -> Config:
     """Load and validate a YAML config from disk.
 
     Wraps :class:`FileNotFoundError`, :class:`yaml.YAMLError`, and
     :class:`pydantic.ValidationError` in :class:`ConfigError`. Validation
     errors are formatted without input values so secrets cannot leak.
+
+    If ``allow_placeholder`` is False (default), a config still on the
+    placeholder ``api.token`` is rejected with a clear error pointing the
+    user at the file to edit. Pass ``allow_placeholder=True`` from
+    informational commands (e.g. ``upstream status``) that want to show
+    the user their config even when they have not set the token yet.
     """
 
     target = resolve_config_path(path)
 
     try:
         raw_text = target.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
+    except FileNotFoundError:
         raise ConfigError(
             f"Config file not found: {target}. Run 'upstream init' to create one."
         ) from None
@@ -141,7 +141,7 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError(f"Config file {target} must be a YAML mapping at the top level.")
 
     try:
-        return Config.model_validate(raw)
+        cfg = Config.model_validate(raw)
     except ValidationError as exc:
         errors = exc.errors(include_input=False, include_url=False)
         lines = []
@@ -151,6 +151,14 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError(
             f"Invalid config in {target}:\n" + "\n".join(lines)
         ) from None
+
+    if cfg.api.is_placeholder_token and not allow_placeholder:
+        raise ConfigError(
+            f"api.token in {target} is still set to the placeholder. "
+            f"Edit the file and replace {PLACEHOLDER_TOKEN} with your real token."
+        )
+
+    return cfg
 
 
 _TEMPLATE = """\
