@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "upstream-agent"
+description = "Public Python agent that streams camera video to the UpStream service."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "UpstreamCV" }]
+keywords = ["video", "streaming", "camera", "srt", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dynamic = ["version"]
+dependencies = [
+    "typer>=0.12",
+    "pyyaml>=6.0",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+upstream = "upstream_agent.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/UpstreamCV/upstream-agent"
+Repository = "https://github.com/UpstreamCV/upstream-agent"
+Issues = "https://github.com/UpstreamCV/upstream-agent/issues"
+
+[tool.hatch.version]
+path = "upstream_agent/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["upstream_agent"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "upstream_agent",
+    "tests",
+    "docs",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
