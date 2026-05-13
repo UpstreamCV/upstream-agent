@@ -9,6 +9,9 @@ Three subcommands today:
 * ``upstream check --camera`` — local camera probe. Opens the
   configured webcam, reads one frame, reports actual resolution/FPS,
   and releases the device. Makes no API call.
+* ``upstream check --api`` — three-step API probe. Registers the agent,
+  registers the camera, and requests a stream session. Stops before
+  any streaming. Never prints the full token or SRT URL.
 
 ``--version`` prints the package version and exits.
 
@@ -29,10 +32,11 @@ from upstream_agent.config import (
     resolve_config_path,
     write_default_config,
 )
+from upstream_agent.diagnostics.api import ApiCheckResult, run_api_check
 from upstream_agent.diagnostics.camera import CameraCheckResult, run_camera_check
 from upstream_agent.errors import UpstreamError
 from upstream_agent.logging_setup import redact_token, setup_logging
-from upstream_agent.state import default_state_path, load_state
+from upstream_agent.state import State, default_state_path, load_state, save_state
 from upstream_agent.version import __version__
 
 app = typer.Typer(
@@ -198,6 +202,21 @@ def _print_camera_check_success(result: CameraCheckResult) -> None:
         )
 
 
+def _print_api_check_success(result: ApiCheckResult) -> None:
+    typer.echo("API check successful")
+    typer.echo(f"Agent registered: {result.agent_id}")
+    typer.echo(f"Camera registered: {result.camera_id}")
+    typer.echo(f"Stream session approved: {result.session_id}")
+    typer.echo(
+        f"Approved config: {result.approved_codec}, "
+        f"{result.approved_width}x{result.approved_height} @ "
+        f"{result.approved_fps} FPS"
+    )
+    typer.echo(
+        f"SRT URL received: {'yes' if result.srt_url_present else 'no'}"
+    )
+
+
 @app.command("check")
 def check_cmd(
     camera: bool = typer.Option(
@@ -205,18 +224,26 @@ def check_cmd(
         "--camera",
         help="Probe the configured camera (open, read one frame, release).",
     ),
+    api: bool = typer.Option(
+        False,
+        "--api",
+        help=(
+            "Probe the API: register agent, register camera, request "
+            "stream session. Stops before streaming."
+        ),
+    ),
     config: Path | None = typer.Option(
         None,
         "--config",
         help="Override the config file path (default: ~/.upstream/config.yaml).",
     ),
 ) -> None:
-    """Run local diagnostics. Currently supports ``--camera``."""
+    """Run local diagnostics. Supports ``--camera`` and ``--api``."""
 
-    if not camera:
+    if not camera and not api:
         typer.echo(
-            "Specify what to check, e.g. `upstream check --camera`. "
-            "See `upstream check --help` for options.",
+            "Specify what to check, e.g. `upstream check --camera` or "
+            "`upstream check --api`. See `upstream check --help` for options.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -233,6 +260,14 @@ def check_cmd(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from None
 
+    if api and cfg.api.is_placeholder_token:
+        typer.echo(
+            "Error: API token is still a placeholder. Edit "
+            f"{config_path} (api.token) and re-run 'upstream check --api'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     sensitive = (
         {cfg.api.token}
         if cfg.api.token and not cfg.api.is_placeholder_token
@@ -244,9 +279,41 @@ def check_cmd(
         sensitive_values=sensitive,
     )
 
-    result = run_camera_check(cfg.camera)
-    if not result.success:
-        typer.echo(f"Error: {result.error}", err=True)
-        raise typer.Exit(code=1)
+    overall_ok = True
+    printed_a_block = False
 
-    _print_camera_check_success(result)
+    if camera:
+        cam_result = run_camera_check(cfg.camera)
+        if not cam_result.success:
+            typer.echo(f"Error: {cam_result.error}", err=True)
+            overall_ok = False
+        else:
+            _print_camera_check_success(cam_result)
+            printed_a_block = True
+
+    if api:
+        if printed_a_block:
+            typer.echo("")
+        state = load_state(default_state_path())
+
+        def _persist(updated: State) -> None:
+            save_state(updated, default_state_path())
+
+        api_result, updated_state = run_api_check(
+            cfg, state, save_progress=_persist
+        )
+        # Final write — idempotent; covers the success path where
+        # save_progress already wrote the last update.
+        save_state(updated_state, default_state_path())
+
+        if not api_result.success:
+            typer.echo(
+                f"Error ({api_result.failed_step}): {api_result.error}",
+                err=True,
+            )
+            overall_ok = False
+        else:
+            _print_api_check_success(api_result)
+
+    if not overall_ok:
+        raise typer.Exit(code=1)

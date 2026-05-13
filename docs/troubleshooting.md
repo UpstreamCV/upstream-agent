@@ -142,6 +142,98 @@ If pip refuses, check that you have a working compiler/wheel index for
 your platform; on Apple Silicon you generally want Python 3.10+ from
 Homebrew or `python.org`, not the system Python.
 
+## API check
+
+### `upstream check --api` says `Config file not found`
+
+Same as the camera check — run `upstream init` first, edit the file
+to point at your token, then re-run.
+
+### `upstream check --api` says `API token is still a placeholder`
+
+The check refuses to run with the default `YOUR_API_TOKEN_HERE`
+value. Open `~/.upstream/config.yaml` and replace `api.token` with
+the real token your team gave you. `upstream check --camera` works
+under the placeholder; `--api` does not (it would just hit a 401).
+
+### `Error (register_agent): Could not connect to API server at ...`
+
+The agent could not reach `api.base_url`. Walk these in order:
+
+1. Is the URL right? Double-check `api.base_url` in
+   `~/.upstream/config.yaml`. The dev server is
+   `http://api.upstreamcv.com`.
+2. Are you online? `curl <base_url>/healthz` or whatever the team's
+   liveness endpoint is.
+3. Are you behind a proxy? Set `HTTPS_PROXY` / `HTTP_PROXY` in your
+   shell and re-run. httpx respects the standard env vars.
+4. Is DNS working? `nslookup api.upstreamcv.com`.
+
+### `Error (register_agent): API token was rejected`
+
+The server returned `401`. Either the token in
+`~/.upstream/config.yaml` is wrong (typo, trailing newline, copied
+the placeholder by mistake) or it has been revoked. Re-paste the
+token and try again. If the error message includes "as revoked",
+generate a new token from the dashboard.
+
+### `Error (register_agent): API token was rejected as revoked`
+
+The token was valid but has been revoked server-side. Generate a new
+one and rewrite `api.token` in `~/.upstream/config.yaml`. The agent
+does not (yet) auto-rotate tokens.
+
+### `Error (register_camera): ...`
+
+The agent registered successfully but the camera was rejected.
+Common causes:
+
+- **`name` not unique on this agent** — change `camera.name` in
+  config.
+- **`source_type: "rtsp"`** — not supported in M3. Use `webcam`.
+- **`requested_*` values out of range** — the server may cap
+  resolution or FPS per plan.
+
+The `agent_id` was still saved to `~/.upstream/agent_state.json` so
+the next attempt won't re-register the agent.
+
+### `Error (start_stream_session): ...`
+
+The agent and camera are registered, but the server refused to
+approve a session. This usually means a plan/quota limit, server
+maintenance, or an internal error. Wait a minute and retry; if it
+persists, check the dashboard.
+
+### `Error (...): API response from POST ... did not match expected shape`
+
+The agent reached the server but the response was missing a field
+the client expected. The backend contract is still being finalised,
+so this is the most likely error during early integration. Compare
+the response against `docs/api-contracts.md` and either:
+
+- Update `upstream_agent/api/schemas.py` to match what the backend
+  actually returns, **or**
+- File an issue with the API team if the response shape is wrong.
+
+The full response body is intentionally **not** included in this
+error message to avoid leaking session tokens / SRT URLs. Inspect
+the raw response with a tool like `curl` or `httpie` during
+development, never paste it into a bug report verbatim.
+
+### `Error (...): API rate limit exceeded`
+
+The server returned 429. Wait a bit. The agent does not retry on its
+own in M3; reconnect/backoff lands in a later milestone.
+
+### My API token appears somewhere
+
+It should not. If you see the full token in stdout, stderr, the log
+file, or any error message, that is a bug — please report it. The
+token redaction filter is supposed to scrub it everywhere. Common
+near-misses we already test for: error messages from the API client,
+log records emitted by httpx when debug logging is on, and config
+display in `upstream status`.
+
 ## Installation
 
 ### `pip install -e .` fails on Python 3.9 or older

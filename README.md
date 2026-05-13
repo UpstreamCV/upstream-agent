@@ -5,9 +5,11 @@ machine, reads a camera feed, asks the UpStream API for permission/config,
 and streams video securely to the UpStream streaming server.
 
 This README reflects the **current shape** of the project. The agent is
-under active development. Today it can be configured locally and probe
-a webcam (open, read one frame, report resolution and FPS, release).
-API registration, encoding, and streaming will land in later milestones.
+under active development. Today it can be configured locally, probe
+a webcam (open, read one frame, report resolution and FPS, release),
+and probe the API (register the agent, register the camera, request
+a stream session) without actually streaming. Encoding and SRT
+transport land in later milestones.
 
 ## Requirements
 
@@ -43,6 +45,9 @@ upstream status
 
 # 4. Verify the configured webcam is accessible.
 upstream check --camera
+
+# 5. Verify the API accepts this agent + camera and approves a stream.
+upstream check --api
 ```
 
 ### Verifying camera access
@@ -77,6 +82,49 @@ config is correct.
 ```
 
 See `docs/troubleshooting.md` for the full list of camera diagnostics.
+
+### Verifying API registration
+
+`upstream check --api` walks the three-step backend flow:
+
+1. Register the agent (using your local `device_id` and the package
+   version).
+2. Register the camera (using the fields under `camera:` in your
+   config).
+3. Request a stream session and confirm the server approves it.
+
+It stops there — no video is captured or transported. Requires a real
+API token in `~/.upstream/config.yaml`; the placeholder is rejected
+with a clear message before any HTTP request is made.
+
+Expected output on success:
+
+```
+API check successful
+Agent registered: agent_123
+Camera registered: cam_456
+Stream session approved: sess_789
+Approved config: h264, 1280x720 @ 30 FPS
+SRT URL received: yes
+```
+
+The returned `agent_id` and `camera_id` are persisted in
+`~/.upstream/agent_state.json` (partial progress is saved after each
+successful step, so a retry doesn't re-register what's already
+registered). The full SRT URL is **never** printed, logged, or
+persisted — only the boolean "received: yes" shows up.
+
+On failure the command exits non-zero with a step-tagged error, e.g.:
+
+```
+Error (register_agent): API token was rejected.
+```
+
+```
+Error (register_camera): POST /v1/cameras/register -> 422 Unprocessable Entity: name already exists.
+```
+
+You can run both probes at once: `upstream check --camera --api`.
 
 ## Configuration
 
@@ -131,10 +179,13 @@ The agent stores everything under `~/.upstream/`:
 
 - **Milestone 1: package skeleton.** CLI, config, state, logging,
   token redaction, tests, docs.
-- **Milestone 2 (current): camera check.** `VideoSource` ABC,
-  `WebcamSource`, `upstream check --camera`.
-- Milestone 3+: API registration, frame buffer, FFmpeg encoder, SRT
-  transport, heartbeat, supervisor, additional source types and
+- **Milestone 2: camera check.** `VideoSource` ABC, `WebcamSource`,
+  `upstream check --camera`.
+- **Milestone 3 (current): API registration.** `UpstreamApiClient`,
+  three POST endpoints (register agent / register camera / start
+  stream session), `upstream check --api`.
+- Milestone 4+: frame buffer, FFmpeg encoder, SRT transport,
+  heartbeat, token rotation, supervisor, additional source types and
   diagnostics.
 
 See `docs/architecture.md` for the planned end-to-end flow.

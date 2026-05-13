@@ -33,25 +33,28 @@ to the UpStream streaming server.
            heartbeat (status, errors, metrics) ──▶ UpStream API
 ```
 
-## What exists today (Milestones 1 and 2)
+## What exists today (Milestones 1, 2, and 3)
 
-The foundation plus a local camera probe. Milestone 1 delivered the
-CLI, config loader, local state, and logging with token redaction.
-Milestone 2 adds the camera-source layer and the `upstream check
---camera` diagnostic so an operator can prove their webcam is usable
-before any of the streaming machinery is built.
+The foundation, a local camera probe, and a three-step API
+registration probe. Milestone 1 delivered the CLI, config loader,
+local state, and logging with token redaction. Milestone 2 added the
+camera-source layer and `upstream check --camera`. Milestone 3 added
+the HTTP client foundation (`upstream_agent/api/`) and
+`upstream check --api`, which proves the backend approves this agent
++ camera for streaming — stopping short of any actual video transport.
 
-Nothing yet talks to the API, encodes video, or streams.
+Nothing yet encodes video or streams.
 
 | Layer | Status |
 | --- | --- |
-| CLI (`upstream init`, `upstream status`, `upstream check`, `--version`) | done |
+| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api`, `--version`) | done |
 | Config loader (YAML + Pydantic validation) | done |
-| Local state (`agent_state.json` with stable `device_id`) | done |
+| Local state (`agent_state.json` with stable `device_id`, `agent_id`, `last_camera_id`) | done |
 | Logging (rotating file + stderr, token redaction) | done |
 | Camera sources (`VideoSource` ABC + `WebcamSource`) | partial (webcam only) |
-| Diagnostics (`upstream check --camera`) | partial (camera only) |
-| API client (registration, config fetch, heartbeat) | **planned** |
+| API client (register-agent / register-camera / start-stream-session) | partial (M3 surface only) |
+| Diagnostics (`upstream check --camera`, `--api`) | partial (camera + API only) |
+| Token rotation, config fetch, heartbeat, event endpoints | **planned** |
 | RTSP / IP camera / file sources | **planned** |
 | Frame buffer | **planned** |
 | FFmpeg encoder | **planned** |
@@ -86,6 +89,52 @@ the loop and gives future check kinds (`--api`, `--storage`,
 
 The check does not call the API. A placeholder `api.token` is allowed
 because the only thing being probed is the local camera.
+
+## API client layer
+
+`upstream_agent/api/` holds the synchronous httpx client. The
+package's surface is intentionally small:
+
+- `client.py` — `UpstreamApiClient` with three public methods
+  (`register_agent`, `register_camera`, `start_stream_session`), an
+  isolated `_build_auth_header()` so swapping the `Bearer` scheme is
+  one place, and one `_request` that handles JSON encode/decode,
+  Pydantic-validated response parsing, and the status-to-typed-error
+  mapping. Endpoint paths are module-level constants
+  (`AGENT_REGISTER_PATH`, `CAMERA_REGISTER_PATH`,
+  `STREAM_SESSION_START_PATH`) so the eventual backend swap is
+  mechanical.
+- `schemas.py` — Pydantic v2 request/response models. Requests use
+  `extra="forbid"` (cannot accidentally send unknown fields);
+  responses use `extra="ignore"` (backend can add fields without
+  breaking us).
+
+`upstream_agent/diagnostics/api.py` is the orchestrator that walks
+the three-step flow. It accepts an injectable `client_factory` (for
+tests) and an optional `save_progress` callback that the CLI uses to
+persist partial state immediately after each successful step — so a
+later failure does not lose earlier IDs.
+
+**`upstream check --api`** is the wiring:
+
+1. Load config; require a non-placeholder `api.token` (the check
+   would fail trivially on the placeholder).
+2. Load local state; pass it through `run_api_check`.
+3. Print a clean six-line success block on success, or
+   `Error (<step>): <message>` on failure.
+
+**Never logged or printed:**
+
+- The full API token. The redaction filter scrubs Bearer headers and
+  the configured token even if a third-party library tries to log
+  them.
+- The SRT URL. The client receives it, the orchestrator extracts only
+  `srt_url_present: bool`, and the URL is dropped along with the
+  response object. The user sees `SRT URL received: yes`.
+
+The check stops *before* any streaming. Future milestones will read
+the SRT URL from a fresh `start_stream_session` call when they
+actually need to connect to the streaming server.
 
 ## Design principles
 

@@ -32,6 +32,73 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-12 - feat: add API client and upstream check --api (Milestone 3)
+
+### Summary
+Milestone 3. Adds the HTTP client foundation (`upstream_agent/api/` with a synchronous httpx-based `UpstreamApiClient`, Pydantic schemas, and isolated endpoint-path constants), a `run_api_check` orchestrator that walks the three-step backend flow (register agent → register camera → start stream session), and the `upstream check --api` CLI command. The agent can now prove the backend approves it for a given camera — stopping before any streaming. No FFmpeg, no SRT transport, no heartbeat, no token rotation; those stay out of scope.
+
+Backend contract is still being finalised by another teammate. Everything that's likely to change (endpoint paths, request fields, response fields, error codes) is isolated to two files so the eventual swap is mechanical.
+
+### Files touched
+- pyproject.toml - added `httpx>=0.27` to runtime dependencies.
+- upstream_agent/errors.py - added `ApiError` plus `ApiConnectionError`, `ApiAuthError`, `ApiTokenRevokedError`, `ApiValidationError`, `ApiRateLimitError`, `ApiServerError`, `ApiContractError`.
+- upstream_agent/api/__init__.py - new package; re-exports the client, path constants, and schemas.
+- upstream_agent/api/schemas.py - new module; Pydantic v2 request/response models for the three endpoints. Requests use `extra="forbid"`; responses use `extra="ignore"`.
+- upstream_agent/api/client.py - new module; `UpstreamApiClient` synchronous wrapper around httpx. Endpoint constants (`AGENT_REGISTER_PATH`, `CAMERA_REGISTER_PATH`, `STREAM_SESSION_START_PATH`), isolated `_build_auth_header()`, one `_request()` that handles JSON encoding, response validation, transport-error mapping, and status-code mapping.
+- upstream_agent/diagnostics/api.py - new module; `ApiCheckResult` frozen dataclass and `run_api_check(cfg, state, *, client_factory=None, save_progress=None)` orchestrator. Never raises; folds `ApiError` into the result. Persists partial progress via the optional `save_progress` callback so a later failure preserves earlier IDs.
+- upstream_agent/cli.py - extended `check_cmd` with the `--api` flag; added `_print_api_check_success` helper. Both flags compose (`--camera --api` runs both sequentially).
+- tests/test_errors.py - extended; 9 new inheritance assertions for the API error hierarchy.
+- tests/test_api_client.py - new file; 21 tests against `httpx.MockTransport` covering happy paths, header construction, base-URL normalisation, every status-code mapping, transport errors, contract errors, and token-leak guards.
+- tests/test_diagnostics_api.py - new file; 8 orchestrator tests against a `FakeUpstreamApiClient` covering happy path, each step-failure scenario, SRT-URL leak guard via `caplog`, and request-payload sanity.
+- tests/test_cli.py - extended; 8 new `--api` tests covering no-config, placeholder rejection, happy path with state persistence, each step-failure with correct partial state, token + SRT URL leak guard, and both-flags-compose.
+- docs/architecture.md - flipped API client and `--api` rows from planned to partial; added an "API client layer" section.
+- docs/module-map.md - moved `api/` from the deferred table to the live table; documented `diagnostics/api.py`, the new error classes, and the new test files.
+- docs/api-contracts.md - replaced the placeholder with concrete (provisional) request/response shapes for the three endpoints, the assumed error-body shape, status-code mapping, and a checklist of pending backend confirmations.
+- docs/troubleshooting.md - added nine API-check entries covering missing config, placeholder token, unreachable, invalid token, revoked token, camera rejected, session rejected, contract mismatch, and rate limit.
+- README.md - to be updated.
+
+### Functions/classes changed
+- `UpstreamApiClient` - synchronous HTTP client. Constructor accepts `base_url`, `token`, and an injectable `transport` for tests. Class method `from_config(cfg.api)` for production wiring. Context-manager support so the underlying httpx connection is closed on failure. Never logs request or response bodies.
+- `_build_auth_header` - isolated helper. Returns `{"Authorization": f"Bearer {token}"}`. Swapping `Bearer` for `X-API-Key` or anything else is one method change.
+- `_request` - handles every shared concern: JSON encode of the typed request body (`exclude_none=True`), `httpx.TransportError → ApiConnectionError`, `_raise_for_status` for non-2xx, JSON decode of the response body, and Pydantic validation against the typed response model with `ValidationError → ApiContractError` and no input values in the error string.
+- `_raise_for_status` - status-to-typed-error mapping: 400/422 → `ApiValidationError`, 401/403 → `ApiAuthError` (or `ApiTokenRevokedError` if backend `error_code == "token_revoked"`), 429 → `ApiRateLimitError`, 5xx → `ApiServerError`, other 4xx → bare `ApiError`. Error messages carry `method`, `path`, `status`, and `reason` but never request or response bodies.
+- `AgentRegisterRequest` / `AgentRegisterResponse` - device-register payload. Carries `device_id`, `agent_version`, and optional `platform` (`platform.system()` value, e.g. "Darwin"). Hostname is intentionally NOT sent — it identifies the customer machine.
+- `CameraRegisterRequest` / `CameraRegisterResponse` - camera-register payload. Carries `agent_id`, `name`, `source_type`, `source`, and the three `requested_*` fields. M3 only exercises the `webcam` source type.
+- `StreamSessionRequest` / `StreamSessionResponse` / `ApprovedStreamConfig` - session approval payload. `ApprovedStreamConfig.srt_url` is documented as sensitive; the orchestrator extracts `srt_url_present: bool` and drops the URL.
+- `ApiCheckResult` - structured outcome of the three-step probe. Carries IDs, the approved-config summary fields (codec/width/height/fps), `srt_url_present: bool`, and a `failed_step: Literal["register_agent" | "register_camera" | "start_stream_session"] | None`. **The SRT URL itself is never on this object.**
+- `run_api_check` - the orchestrator. Builds the request from `state.device_id` + `__version__` + `platform.system()`, then walks the three calls. After each successful step, immutably updates state via `state.model_copy(update={...})` and invokes the optional `save_progress` callback. Catches `ApiError`; lets other exceptions propagate.
+- `check_cmd` - extended to accept `--api`. Validates exactly-one-flag-or-both-flags; rejects placeholder token before any HTTP request; sets up logging with the real token in `sensitive_values`; runs camera check then API check (if both flags set); exits 1 if any failed, 2 if no flag, 0 on full success.
+- API error classes - all inherit from `UpstreamError`, so the CLI's existing top-level catch picks them up with no change. `ApiTokenRevokedError` is also a subclass of `ApiAuthError`.
+
+### System interaction notes
+The new flow on `upstream check --api`:
+`resolve_config_path` → `load_config(allow_placeholder=True)` → reject placeholder if `--api` was passed → `setup_logging(sensitive_values={cfg.api.token})` → `load_state(default_state_path())` → `run_api_check(cfg, state, save_progress=save_state)`.
+
+The orchestrator:
+1. `client.register_agent(req)` → `state.agent_id = resp.agent_id`; calls `save_progress(state)` so `agent_state.json` records the new ID immediately.
+2. `client.register_camera(req)` → `state.last_camera_id = resp.camera_id`; calls `save_progress(state)`.
+3. `client.start_stream_session(req)` → no state update; the session ID and SRT URL are not persisted.
+
+If any step fails, the orchestrator returns `(failure_result, working_state)` immediately. The CLI does a final `save_state(updated_state)` (idempotent) before exiting.
+
+**Secrets handling:** the token redaction filter is on the logger handlers, so even if httpx debug-logs an `Authorization` header it gets scrubbed. The SRT URL is held in memory only inside the response object and dropped after the orchestrator extracts the boolean. The result, the CLI output, and the log file all stay clean.
+
+### Testing/checks
+- `pytest -q` passes (135 tests; 86 from M1/M2 + 49 new).
+- All M3 tests are mocked (`httpx.MockTransport` for the client; a `FakeUpstreamApiClient` for the orchestrator; a `_default_factory` monkeypatch for CLI). No real backend, no internet, no real token.
+- Token-leak guards: real-looking config tokens never appear in stdout, stderr, the log file, or any captured `ApiError` message.
+- SRT-URL leak guard: a sentinel URL planted in the fake response never appears in `dataclasses.asdict(result)`, `caplog` records, stdout, stderr, or the log file.
+- `upstream check` (no flag) now mentions both `--camera` and `--api` in the usage hint.
+- `upstream check --camera --api` runs both probes; camera block prints before API block.
+- Real-backend smoke against `http://api.upstreamcv.com` is the next manual step once a real token is provisioned.
+
+### Follow-up TODOs
+- Smoke against the real dev backend once a token is available; confirm the provisional paths and field names with the API teammate.
+- Add token-rotation handling (server-pushed refresh).
+- Add `upstream check --network` / `--ffmpeg` / `--storage` flags as later milestones bring those layers online; the flag-composition design already supports them.
+
+---
+
 ## 2026-05-12 - feat: add camera source layer and upstream check --camera (Milestone 2)
 
 ### Summary

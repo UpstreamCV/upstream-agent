@@ -280,6 +280,8 @@ def test_check_no_flag_exits_with_usage_hint(home_dir: Path) -> None:
     result = runner.invoke(app, ["check"])
     assert result.exit_code == 2
     assert "Specify what to check" in result.stderr
+    assert "--camera" in result.stderr
+    assert "--api" in result.stderr
 
 
 def test_check_camera_without_config_exits_with_init_hint(home_dir: Path) -> None:
@@ -403,3 +405,233 @@ def test_check_camera_fps_unknown_when_driver_reports_zero(
     result = runner.invoke(app, ["check", "--camera"])
     assert result.exit_code == 0
     assert "FPS: unknown" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# upstream check --api
+# ---------------------------------------------------------------------------
+
+
+_API_SECRET_SRT_URL = "srt://stream.test.local:1935/live/CLI_TEST_SECRET_STREAM_TOKEN"
+
+
+def _install_fake_api_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_response: dict | None = None,
+    agent_raises: Exception | None = None,
+    camera_response: dict | None = None,
+    camera_raises: Exception | None = None,
+    session_response: dict | None = None,
+    session_raises: Exception | None = None,
+) -> dict:
+    """Install a fake UpstreamApiClient on the diagnostics module.
+
+    Returns a captures dict so tests can inspect call counts and the
+    actual request payloads.
+    """
+
+    from upstream_agent.api.schemas import (
+        AgentRegisterResponse,
+        ApprovedStreamConfig,
+        CameraRegisterResponse,
+        StreamSessionResponse,
+    )
+    from upstream_agent.diagnostics import api as api_module
+
+    default_agent = AgentRegisterResponse(agent_id="agent_123")
+    default_camera = CameraRegisterResponse(camera_id="cam_456")
+    default_session = StreamSessionResponse(
+        session_id="sess_789",
+        approved_config=ApprovedStreamConfig(
+            codec="h264",
+            width=1280,
+            height=720,
+            fps=30,
+            srt_url=_API_SECRET_SRT_URL,
+        ),
+    )
+
+    captures: dict = {
+        "agent_calls": 0,
+        "camera_calls": 0,
+        "session_calls": 0,
+        "factory_called_with_base_url": None,
+    }
+
+    class FakeClient:
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def register_agent(self, req: object) -> object:
+            captures["agent_calls"] += 1
+            if agent_raises is not None:
+                raise agent_raises
+            if agent_response is not None:
+                return AgentRegisterResponse.model_validate(agent_response)
+            return default_agent
+
+        def register_camera(self, req: object) -> object:
+            captures["camera_calls"] += 1
+            if camera_raises is not None:
+                raise camera_raises
+            if camera_response is not None:
+                return CameraRegisterResponse.model_validate(camera_response)
+            return default_camera
+
+        def start_stream_session(self, req: object) -> object:
+            captures["session_calls"] += 1
+            if session_raises is not None:
+                raise session_raises
+            if session_response is not None:
+                return StreamSessionResponse.model_validate(session_response)
+            return default_session
+
+    def fake_factory(cfg):  # type: ignore[no-untyped-def]
+        captures["factory_called_with_base_url"] = cfg.base_url
+        return FakeClient()
+
+    monkeypatch.setattr(api_module, "_default_factory", fake_factory)
+    return captures
+
+
+def test_check_api_no_config_exits_with_init_hint(home_dir: Path) -> None:
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 1
+    assert "No config found" in result.stderr
+    assert "upstream init" in result.stderr
+
+
+def test_check_api_with_placeholder_token_exits_one(home_dir: Path) -> None:
+    _write_camera_config(home_dir, token=PLACEHOLDER_TOKEN)
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 1
+    assert "API token is still a placeholder" in result.stderr
+
+
+def test_check_api_happy_path_prints_block_and_saves_state(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "API check successful" in result.stdout
+    assert "Agent registered: agent_123" in result.stdout
+    assert "Camera registered: cam_456" in result.stdout
+    assert "Stream session approved: sess_789" in result.stdout
+    assert "Approved config: h264, 1280x720 @ 30 FPS" in result.stdout
+    assert "SRT URL received: yes" in result.stdout
+
+    state_file = home_dir / ".upstream" / "agent_state.json"
+    assert state_file.exists()
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["agent_id"] == "agent_123"
+    assert state["last_camera_id"] == "cam_456"
+
+
+def test_check_api_register_agent_failure_exits_one(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from upstream_agent.errors import ApiAuthError
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_api_client(
+        monkeypatch, agent_raises=ApiAuthError("API token was rejected.")
+    )
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 1
+    assert "Error (register_agent):" in result.stderr
+    assert "rejected" in result.stderr
+
+    # No agent_id was saved.
+    state_file = home_dir / ".upstream" / "agent_state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state.get("agent_id") is None
+    assert state.get("last_camera_id") is None
+
+
+def test_check_api_register_camera_failure_persists_agent_id_only(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from upstream_agent.errors import ApiValidationError
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_api_client(
+        monkeypatch,
+        camera_raises=ApiValidationError("name already in use"),
+    )
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 1
+    assert "Error (register_camera):" in result.stderr
+
+    state_file = home_dir / ".upstream" / "agent_state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["agent_id"] == "agent_123"
+    assert state.get("last_camera_id") is None
+
+
+def test_check_api_session_failure_persists_both_ids(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from upstream_agent.errors import ApiServerError
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_api_client(
+        monkeypatch, session_raises=ApiServerError("overloaded")
+    )
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 1
+    assert "Error (start_stream_session):" in result.stderr
+
+    state_file = home_dir / ".upstream" / "agent_state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["agent_id"] == "agent_123"
+    assert state["last_camera_id"] == "cam_456"
+
+
+def test_check_api_does_not_leak_token_or_srt_url(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_token = "sk_live_abcd_must_not_leak_zzz"
+    _write_camera_config(home_dir, token=secret_token)
+    _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 0
+    assert secret_token not in result.stdout
+    assert secret_token not in result.stderr
+    assert _API_SECRET_SRT_URL not in result.stdout
+    assert _API_SECRET_SRT_URL not in result.stderr
+
+    # Log file must not carry the token or full URL either.
+    log_file = home_dir / ".upstream" / "logs" / "agent.log"
+    if log_file.exists():
+        content = log_file.read_text(encoding="utf-8")
+        assert secret_token not in content
+        assert _API_SECRET_SRT_URL not in content
+
+
+def test_check_camera_and_api_both_flags_runs_both(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    monkeypatch.setitem(sys.modules, "cv2", _build_fake_cv2(opens=True))
+    _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--camera", "--api"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Camera opened successfully" in result.stdout
+    assert "API check successful" in result.stdout
+    # Camera block prints before API block.
+    cam_idx = result.stdout.index("Camera opened successfully")
+    api_idx = result.stdout.index("API check successful")
+    assert cam_idx < api_idx

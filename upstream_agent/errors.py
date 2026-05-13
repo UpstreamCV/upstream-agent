@@ -38,3 +38,35 @@ class UnsupportedCameraSourceError(CameraError):
 
 class CameraDependencyMissingError(CameraError):
     """Raised when a required camera system library (e.g. OpenCV) is not installed."""
+
+
+class ApiError(UpstreamError):
+    """Base class for all UpStream API client errors."""
+
+
+class ApiConnectionError(ApiError):
+    """Raised when the API server cannot be reached (timeout, DNS, refused, etc.)."""
+
+
+class ApiAuthError(ApiError):
+    """Raised when the server rejects the credentials (401/403)."""
+
+
+class ApiTokenRevokedError(ApiAuthError):
+    """Raised when the server signals that the token has been revoked."""
+
+
+class ApiValidationError(ApiError):
+    """Raised when the server rejects a request body (400/422)."""
+
+
+class ApiRateLimitError(ApiError):
+    """Raised when the server returns 429."""
+
+
+class ApiServerError(ApiError):
+    """Raised when the server returns 5xx."""
+
+
+class ApiContractError(ApiError):
+    """Raised when an API response is missing required fields or is not valid JSON."""
