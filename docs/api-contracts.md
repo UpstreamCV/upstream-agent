@@ -17,6 +17,21 @@ reflect what the API team has settled on.
 > which now reports honest probed values (`{"ffmpeg":
 > "<version>", "srt": <bool>}`) instead of the hardcoded
 > `{"ffmpeg": false, "srt": false}`.
+>
+> **Milestone 5 prep update:** still no new endpoints. The live
+> streaming command (`upstream run`) reuses the same four endpoints.
+> The only behavioural difference from `check --api` /
+> `check --streaming` is that `upstream run` keeps the session open
+> for the duration of the stream and calls `stop_stream_session`
+> only on shutdown (or on any error path) — instead of stopping
+> immediately after `start_stream_session` returns.
+>
+> **Blocker for M5 real smoke:** the SRT URL returned by
+> `start_stream_session` must point at a host/port the agent can
+> reach. Local-dev environments currently get a URL whose host or
+> port doesn't reach the running MediaMTX; the agent's runtime is
+> otherwise complete and gates the real end-to-end smoke on this
+> being fixed server-side.
 
 ## Base URLs
 

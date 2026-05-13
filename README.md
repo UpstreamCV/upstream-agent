@@ -8,10 +8,13 @@ This README reflects the **current shape** of the project. The agent is
 under active development. Today it can be configured locally, probe
 a webcam (open, read one frame, report resolution and FPS, release),
 probe the API (register the agent, register the camera, request
-a stream session), and run a streaming preflight (verify FFmpeg, SRT
-support, H264, build the FFmpeg command Milestone 5 will execute) —
-all without actually streaming. Encoding and SRT transport land in
-Milestone 5.
+a stream session), run a streaming preflight (verify FFmpeg, SRT
+support, H264, build the FFmpeg command Milestone 5 will execute),
+and run the live streaming loop end-to-end (`upstream run`).
+Milestone 5 is in **preview**: the runtime works under mocks/fakes
+and against a hand-pointed MediaMTX via a temporary dev override,
+but the real backend smoke is still gated on `upstream-api-server`
+returning an SRT URL whose host/port reaches MediaMTX.
 
 ## Requirements
 
@@ -53,6 +56,9 @@ upstream check --api
 
 # 6. Verify this machine is ready to stream (FFmpeg, SRT, H264, command build).
 upstream check --streaming
+
+# 7. Stream video. Press Ctrl+C to stop.
+upstream run
 ```
 
 ### Verifying camera access
@@ -225,6 +231,58 @@ on `register_agent`: ``{"ffmpeg": "<version>", "srt": <bool>}`` based
 on the local probe. This applies to both `--api` and `--streaming`
 runs.
 
+### Streaming video (preview)
+
+`upstream run` is the live streaming command. It opens the camera,
+requests a stream session, starts FFmpeg, and pipes BGR frames over
+SRT until you press `Ctrl+C`.
+
+```bash
+upstream run
+```
+
+Expected output:
+
+```
+Starting UpStream agent...
+Camera opened: webcam 0
+API session approved
+Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced
+FFmpeg started
+Streaming started
+Press Ctrl+C to stop.
+```
+
+On shutdown (Ctrl+C or any error):
+
+```
+Stopping stream...
+FFmpeg stopped
+Camera released
+Stream session stopped
+```
+
+The agent uses the **server-approved** resolution, FPS, bitrate, and
+codec — not the local config values, which are only sent as a
+preference. If the camera negotiates a different resolution than the
+server approves, the agent resizes frames before piping them to
+FFmpeg.
+
+The full SRT URL, the `streamid`, the `session_token`, and the API
+token are **never** printed or logged. The FFmpeg command, which
+contains the URL, is held in a single local variable and never
+appears in `__repr__`, error messages, or log records.
+
+**Milestone 5 is in preview.** The end-to-end smoke against a real
+backend is blocked until `upstream-api-server` returns an SRT URL
+whose host/port reaches a running MediaMTX. The mocked tests cover
+every cleanup path; the live smoke is the remaining acceptance
+criterion. See `docs/troubleshooting.md` for the temporary dev
+override.
+
+Heartbeat, reconnect/backoff, and token rotation are deferred to
+Milestone 6+.
+
 ## Configuration
 
 The agent reads a YAML config file. Default location:
@@ -295,11 +353,16 @@ The agent stores everything under `~/.upstream/`:
 - **Milestone 3: API registration.** `UpstreamApiClient`,
   three POST endpoints (register agent / register camera / start
   stream session), `upstream check --api`.
-- **Milestone 4 (current): streaming preflight.** FFmpeg probe, SRT
-  URL parser, FFmpeg command builder, `upstream check --streaming`.
-  No live streaming yet.
-- Milestone 5+: live SRT streaming, frame buffer, heartbeat, token
-  rotation, supervisor, additional source types and diagnostics.
+- **Milestone 4: streaming preflight.** FFmpeg probe, SRT URL parser,
+  FFmpeg command builder, `upstream check --streaming`.
+- **Milestone 5 (preview, current): live streaming runtime.**
+  `FfmpegEncoderProcess`, supervisor (`upstream_agent/supervisor.py`),
+  and `upstream run`. Pipes BGR webcam frames through FFmpeg to SRT.
+  Full real-backend smoke is blocked until the API returns an SRT
+  URL whose host/port reaches a running MediaMTX — see
+  `docs/troubleshooting.md` for the dev override.
+- Milestone 6+: heartbeat, reconnect/backoff, token rotation,
+  additional source types and diagnostics.
 
 See `docs/architecture.md` for the planned end-to-end flow.
 

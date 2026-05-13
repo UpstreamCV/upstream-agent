@@ -33,40 +33,45 @@ to the UpStream streaming server.
            heartbeat (status, errors, metrics) ──▶ UpStream API
 ```
 
-## What exists today (Milestones 1–4)
+## What exists today (Milestones 1–5 prep)
 
-The foundation, a local camera probe, a three-step API registration
-probe, and a local streaming preflight. Milestone 1 delivered the
-CLI, config loader, local state, and logging with token redaction.
-Milestone 2 added the camera-source layer and
-`upstream check --camera`. Milestone 3 added the HTTP client
-foundation (`upstream_agent/api/`) and `upstream check --api`, which
-proves the backend approves this agent + camera for streaming.
-Milestone 4 adds the local FFmpeg/SRT/H264 preflight, the SRT URL
-parser, the FFmpeg command builder, and `upstream check --streaming`
-— still stopping short of any actual video transport.
+Milestone 1 delivered the CLI, config loader, local state, and
+logging with token redaction. Milestone 2 added the camera-source
+layer and `upstream check --camera`. Milestone 3 added the HTTP
+client and `upstream check --api`. Milestone 4 added the local
+FFmpeg/SRT/H264 preflight, the SRT URL parser, the FFmpeg command
+builder, and `upstream check --streaming`. **Milestone 5 prep**
+(this milestone) adds the `FfmpegEncoderProcess` subprocess
+wrapper, the supervisor (`upstream_agent/supervisor.py`), and
+`upstream run` — the first command that actually streams video.
 
-Nothing yet encodes video or streams over SRT — but the agent can
-now verify *every* piece needed to do so.
+The runtime works end-to-end under fakes/mocks. Real-backend smoke
+against MediaMTX is still gated on `upstream-api-server` returning
+an SRT URL whose host/port reaches the running MediaMTX. A
+temporary env-only dev override
+(`UPSTREAM_DEV_SRT_URL_OVERRIDE`) unblocks local testing in the
+meantime; it will be removed once the API ingest host/port issue
+is fixed.
 
 | Layer | Status |
 | --- | --- |
-| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api` / `--streaming`, `--version`) | done |
+| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api` / `--streaming`, `upstream run`, `--version`) | done |
 | Config loader (YAML + Pydantic validation) | done |
 | Local state (`agent_state.json` with stable `device_id`, `agent_id`, `last_camera_id`) | done |
 | Logging (rotating file + stderr, token redaction) | done |
 | Camera sources (`VideoSource` ABC + `WebcamSource`) | partial (webcam only) |
 | API client (register-agent / register-camera / start/stop-stream-session) | M3 contract confirmed; mocked tests green |
-| Diagnostics (camera, API, streaming preflight) | done for M4 scope |
+| Diagnostics (camera, API, streaming preflight) | done |
 | FFmpeg probe (version / SRT protocol / H264 encoder) | done |
 | SRT URL parsing/validation | done |
-| FFmpeg command builder | done (provisional input — finalised in M5) |
+| FFmpeg command builder | done |
 | Honest agent capabilities reporting via `register_agent` | done |
-| Live SRT streaming (FFmpeg subprocess + frame piping) | **M5** |
+| FFmpeg subprocess wrapper (`FfmpegEncoderProcess`) | done (M5 prep) |
+| Supervisor / runtime (`run_agent`) | done (M5 prep); real smoke blocked on API ingest host/port |
+| Live SRT streaming end-to-end against real MediaMTX | **gated on API fix** |
 | Frame buffer | **planned** |
-| Token rotation, config fetch, heartbeat, event endpoints | **planned** |
+| Heartbeat, reconnect/backoff, token rotation, config fetch | **planned (M6+)** |
 | RTSP / IP camera / file sources | **planned** |
-| Supervisor (orchestrates the running agent) | **planned** |
 
 ## Camera source layer
 
@@ -212,6 +217,95 @@ Milestone 4, both `--api` and `--streaming` probe FFmpeg once and
 send `{"ffmpeg": "<version>", "srt": <bool>}` based on what the
 local binary actually supports. The probe is fast (~50 ms) and runs
 only when the check needs to call the API.
+
+## Runtime layer (Milestone 5 prep)
+
+`upstream run` is the live streaming command. The runtime chains
+the existing pieces:
+
+```
+Config ── FFmpeg probe ── Camera open ── API session approval ── Command build ── FFmpeg start ── Frame loop ── Cleanup
+                                              │
+                                          (session held open
+                                           for the lifetime of
+                                           the run, not stopped
+                                           immediately)
+```
+
+The orchestrator is :func:`upstream_agent.supervisor.run_agent`. It
+reuses every M3/M4 module verbatim:
+
+- :func:`upstream_agent.diagnostics.ffmpeg_check.probe_ffmpeg` —
+  probes the local binary; results feed both the capability payload
+  sent to `register_agent` and the H264 encoder chosen for the
+  output command.
+- :func:`upstream_agent.diagnostics.api._obtain_stream_approval` —
+  same private helper used by `upstream check --api` and
+  `upstream check --streaming`. Returns the same outcome shape;
+  `run_agent` holds onto the `StreamSessionResponse` only long
+  enough to extract the SRT URL into a local variable.
+- :func:`upstream_agent.transport.srt.parse_srt_url` — validates
+  the API-issued URL (and, if set, the dev override URL).
+- :func:`upstream_agent.encoder.command_builder.build_ffmpeg_command`
+  and :func:`redact_command` — produce the raw FFmpeg argv (with
+  the URL) and a redacted copy for logs/repr.
+- :class:`upstream_agent.encoder.ffmpeg.FfmpegEncoderProcess` —
+  owns the `subprocess.Popen`, the stdin pipe, and the lifecycle
+  (`start`, `write_frame`, `poll`, `stop`).
+- :class:`upstream_agent.sources.webcam.WebcamSource` — context-
+  managed BGR frame source.
+
+The frame loop is intentionally simple: read a frame, resize if
+the camera shape doesn't match the server-approved shape, `tobytes`
+it, write to FFmpeg's stdin. After every write the supervisor polls
+FFmpeg; if FFmpeg exited mid-stream the supervisor raises
+:class:`FfmpegExitError` and cleanup runs.
+
+**Cleanup order** is the same regardless of how the loop exits
+(normal completion, max_frames hit, Ctrl+C, FFmpeg start failure,
+mid-stream FFmpeg exit, camera read failure, API approval failure):
+
+1. `FfmpegEncoderProcess.stop()` — closes stdin so FFmpeg can drain
+   the mpegts trailer, then SIGTERM with a timeout, then SIGKILL.
+2. `WebcamSource.close()` — releases the OpenCV capture.
+3. `client.stop_stream_session(session_id)` — best-effort; a
+   failure here is logged as a warning, not propagated.
+
+This ordering matches the user-visible shutdown block (`FFmpeg
+stopped` → `Camera released` → `Stream session stopped`).
+
+**Lifetime difference vs. preflight.** `upstream check --api` and
+`upstream check --streaming` stop the API session almost
+immediately after `start_stream_session` returns. `upstream run`
+keeps the session open for the duration of the frame loop and
+only stops it on shutdown. No new API endpoint is required — the
+existing `start`/`stop` pair is sufficient.
+
+**Sensitive-data discipline.**
+
+- The raw SRT URL lives in a single local variable inside
+  `run_agent` from the moment `_obtain_stream_approval` returns
+  until the supervisor exits. It is passed once into
+  `build_ffmpeg_command` and once into
+  `FfmpegEncoderProcess(command, redacted_command)`. It is never
+  stored on the result object or any persisted state.
+- `FfmpegEncoderProcess.__repr__` returns only the redacted argv.
+  Error messages from the wrapper (`FfmpegStartError`,
+  `FfmpegWriteError`) never contain the URL; if FFmpeg echoes the
+  URL in its own stderr, the wrapper scrubs any line containing
+  `srt://` before quoting a short tail.
+- The dev override warning is a fixed string with no URL substring.
+
+**M5-prep blocker.** The end-to-end smoke against a real MediaMTX
+is gated on `upstream-api-server` returning an SRT URL whose
+host/port reaches the running MediaMTX. The runtime is otherwise
+fully functional — the mocked tests prove every cleanup path. A
+temporary, undocumented-in-README env override
+(`UPSTREAM_DEV_SRT_URL_OVERRIDE`) lets local development swap the
+SRT URL handed to FFmpeg while keeping the real API session
+start/stop intact. The override is documented in
+`docs/troubleshooting.md` only and will be removed once the API
+returns a correct local/dev ingest host/port.
 
 ## Design principles
 

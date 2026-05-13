@@ -419,6 +419,91 @@ verifies every prerequisite for streaming but does not start a
 long-running FFmpeg process or push any frames. Live streaming
 lands in Milestone 5.
 
+## Live streaming (`upstream run`)
+
+`upstream run` is the first command that actually streams video. It
+opens the camera, requests a stream session, launches FFmpeg, pipes
+BGR frames over SRT, and stops everything cleanly on `Ctrl+C` (or
+on any error).
+
+### `Error: FFmpeg binary not found.` or `FFmpeg is not installed or not on PATH.`
+
+The `upstream check --streaming` troubleshooting entries above apply
+verbatim. The runtime probes FFmpeg before opening the camera or
+contacting the API, so a missing/unsupported binary fails fast
+without side effects.
+
+### `Error (register_agent|register_camera|start_stream_session): ...`
+
+The API rejected the run before any FFmpeg subprocess was started.
+Same diagnostics as `upstream check --api`: confirm your token,
+verify the camera config is valid, and check `request_id` in the
+error message with the backend team.
+
+### `Error: FFmpeg pipe closed; exit_code=...`
+
+FFmpeg exited while the agent was still piping frames. This is the
+runtime's `FfmpegWriteError`. Common causes:
+
+- The SRT server (MediaMTX) refused or dropped the connection.
+- A network blip closed the underlying TCP/UDT link.
+- FFmpeg's stderr (if anything was emitted that didn't contain
+  `srt://`) is included as a short scrubbed snippet — that's the
+  best hint.
+
+The error message contains the FFmpeg exit code but never echoes
+the SRT URL.
+
+### `Error: FFmpeg exited mid-stream with code ...`
+
+Same root cause as the previous entry, detected by the supervisor's
+post-write `poll()`. The supervisor stops the camera and the API
+session before propagating.
+
+### `Error: Camera was opened but failed to read a frame.`
+
+The webcam was disconnected or stopped producing data mid-stream.
+The supervisor stops FFmpeg, releases the camera, and stops the
+API session before propagating. Reconnecting the camera and re-
+running is the fix.
+
+### Stream session won't end after Ctrl+C
+
+The supervisor's cleanup tries to stop the session best-effort. If
+the server is unreachable at shutdown, the agent prints
+`Warning: failed to stop stream session: ...` and exits 0 anyway.
+The server-side session will expire on its own.
+
+### `upstream run` ends immediately with "Stream session stopped" and no `Streaming started`
+
+Almost certainly the SRT URL the backend returned points at a host
+or port the agent cannot reach — the underlying SRT push fails
+before any frame is written, and FFmpeg exits quickly. See the
+"M5-prep dev override" entry below for a workaround while the API
+ingest host/port issue is being fixed.
+
+### M5-prep dev override (temporary)
+
+While `upstream-api-server` is being updated to return an SRT URL
+whose host/port reaches a running MediaMTX, the agent honours a
+temporary env-only override:
+
+```
+UPSTREAM_DEV_SRT_URL_OVERRIDE="srt://<your-mediamtx-host>:8890/?streamid=publish:<channel>" upstream run
+```
+
+When this env var is set:
+
+- The agent still creates a real API session via
+  `start_stream_session` and stops it on shutdown.
+- The URL the API returned is **replaced** with the override before
+  the FFmpeg command is built.
+- A single fixed warning line is logged. The line contains no URL.
+
+This override is **temporary**. It will be removed once the API
+returns a correct local/dev ingest host/port. Do not document this
+in user-facing materials and do not rely on it in production.
+
 ## Installation
 
 ### `pip install -e .` fails on Python 3.9 or older

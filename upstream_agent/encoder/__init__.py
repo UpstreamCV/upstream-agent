@@ -9,5 +9,6 @@ from upstream_agent.encoder.command_builder import (
     build_ffmpeg_command,
     redact_command,
 )
+from upstream_agent.encoder.ffmpeg import FfmpegEncoderProcess
 
-__all__ = ["build_ffmpeg_command", "redact_command"]
+__all__ = ["FfmpegEncoderProcess", "build_ffmpeg_command", "redact_command"]

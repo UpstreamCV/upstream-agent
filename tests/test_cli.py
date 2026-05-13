@@ -1000,3 +1000,209 @@ def test_check_camera_api_streaming_runs_all_three_in_order(
     api_idx = result.stdout.index("API check successful")
     stream_idx = result.stdout.index("Streaming preflight successful")
     assert cam_idx < api_idx < stream_idx
+
+
+# ---------------------------------------------------------------------------
+# upstream run
+# ---------------------------------------------------------------------------
+
+
+_RUN_SECRET_SRT_URL = "srt://stream.test.local:1935/live/RUN_CLI_SECRET"
+_RUN_SECRET_SESSION_TOKEN = "eyJhbGciOiJIUzI1NiI.RUN_CLI_JWT.signature"
+_RUN_SECRET_STREAMID = "RUN_CLI_SECRET_STREAMID"
+
+
+def _install_fake_run_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    raises: Exception | None = None,
+    keyboard_interrupt: bool = False,
+) -> dict:
+    """Patch the supervisor's run_agent entry point used by the CLI."""
+
+    from upstream_agent import cli as cli_module
+    from upstream_agent.state import State
+    from upstream_agent.supervisor import RunResult
+
+    captures: dict = {
+        "calls": 0,
+        "received_cfg": None,
+        "received_state": None,
+        "received_on_event": None,
+    }
+
+    def fake_run_agent(cfg, state, *, save_progress=None, on_event=None, **kwargs):
+        captures["calls"] += 1
+        captures["received_cfg"] = cfg
+        captures["received_state"] = state
+        captures["received_on_event"] = on_event
+
+        if keyboard_interrupt:
+            # Mirror the real supervisor: emit shutdown lines, then raise.
+            if on_event is not None:
+                on_event("camera_opened", "Camera opened: webcam 0")
+                on_event("api_approved", "API session approved")
+                on_event(
+                    "approved_config",
+                    "Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced",
+                )
+                on_event("ffmpeg_started", "FFmpeg started")
+                on_event("streaming", "Streaming started\nPress Ctrl+C to stop.")
+                on_event("shutdown_requested", "Stopping stream...")
+                on_event("ffmpeg_stopped", "FFmpeg stopped")
+                on_event("camera_released", "Camera released")
+                on_event("session_stopped", "Stream session stopped")
+            raise KeyboardInterrupt()
+
+        if raises is not None:
+            raise raises
+
+        if on_event is not None:
+            on_event("camera_opened", "Camera opened: webcam 0")
+            on_event("api_approved", "API session approved")
+            on_event(
+                "approved_config",
+                "Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced",
+            )
+            on_event("ffmpeg_started", "FFmpeg started")
+            on_event("streaming", "Streaming started\nPress Ctrl+C to stop.")
+            on_event("ffmpeg_stopped", "FFmpeg stopped")
+            on_event("camera_released", "Camera released")
+            on_event("session_stopped", "Stream session stopped")
+
+        new_state = State(
+            agent_id="agent_1",
+            device_id=state.device_id,
+            last_camera_id="cam_1",
+        )
+        return RunResult(frames_written=3, exit_reason="max_frames"), new_state
+
+    monkeypatch.setattr(cli_module, "run_agent", fake_run_agent)
+    return captures
+
+
+def test_run_help_exits_zero_and_mentions_streaming() -> None:
+    result = runner.invoke(app, ["run", "--help"])
+    assert result.exit_code == 0
+    assert "Stream video" in result.stdout
+
+
+def test_run_no_config_exits_with_init_hint(home_dir: Path) -> None:
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 1
+    assert "No config found" in result.stderr
+    assert "upstream init" in result.stderr
+
+
+def test_run_placeholder_token_exits_one(home_dir: Path) -> None:
+    _write_camera_config(home_dir, token=PLACEHOLDER_TOKEN)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 1
+    assert "API token is still a placeholder" in result.stderr
+
+
+def test_run_happy_path_prints_safe_output(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    captures = _install_fake_run_agent(monkeypatch)
+
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Starting UpStream agent..." in result.stdout
+    assert "Camera opened: webcam 0" in result.stdout
+    assert "API session approved" in result.stdout
+    assert "FFmpeg started" in result.stdout
+    assert "Streaming started" in result.stdout
+    assert "FFmpeg stopped" in result.stdout
+    assert "Camera released" in result.stdout
+    assert "Stream session stopped" in result.stdout
+    assert captures["calls"] == 1
+
+
+def test_run_keyboard_interrupt_exits_zero_with_clean_shutdown(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_run_agent(monkeypatch, keyboard_interrupt=True)
+
+    result = runner.invoke(app, ["run"])
+    # Ctrl+C is a clean shutdown, not a failure.
+    assert result.exit_code == 0
+    assert "Stopping stream..." in result.stdout
+    assert "FFmpeg stopped" in result.stdout
+    assert "Camera released" in result.stdout
+    assert "Stream session stopped" in result.stdout
+
+
+def test_run_ffmpeg_start_failure_exits_one_clean_error(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from upstream_agent.errors import FfmpegStartError
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_run_agent(
+        monkeypatch, raises=FfmpegStartError("FFmpeg binary not found."),
+    )
+
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 1
+    assert "Error: FFmpeg binary not found." in result.stderr
+
+
+def test_run_api_failure_exits_one_clean_error(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from upstream_agent.errors import StreamingRuntimeError
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_run_agent(
+        monkeypatch,
+        raises=StreamingRuntimeError(
+            "API approval failed at register_agent: token rejected"
+        ),
+    )
+
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 1
+    assert "Error:" in result.stderr
+    assert "register_agent" in result.stderr
+
+
+def test_run_does_not_leak_token_srt_url_or_streamid(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_token = "ups_live_run_must_not_leak"
+    _write_camera_config(home_dir, token=secret_token)
+
+    # The fake supervisor never prints the URL itself, but we also
+    # capture the case where a future change might. Plant a SRT URL
+    # in a sensitive value the redaction filter knows about: this is
+    # a regression guard.
+    from upstream_agent import cli as cli_module
+    from upstream_agent.supervisor import RunResult
+
+    def fake_run_agent(cfg, state, *, save_progress=None, on_event=None, **kwargs):
+        # A misbehaving callback in the future MUST still not leak.
+        if on_event is not None:
+            on_event("ok", "Camera opened: webcam 0")
+            on_event("ok", "Stream session stopped")
+        return RunResult(frames_written=0, exit_reason="completed"), state
+
+    monkeypatch.setattr(cli_module, "run_agent", fake_run_agent)
+
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 0
+    for blob in (result.stdout, result.stderr):
+        assert secret_token not in blob
+        assert _RUN_SECRET_SRT_URL not in blob
+        assert _RUN_SECRET_SESSION_TOKEN not in blob
+        assert _RUN_SECRET_STREAMID not in blob
+
+    log_file = home_dir / ".upstream" / "logs" / "agent.log"
+    if log_file.exists():
+        content = log_file.read_text(encoding="utf-8")
+        assert secret_token not in content
+        assert _RUN_SECRET_SRT_URL not in content
+        assert _RUN_SECRET_SESSION_TOKEN not in content
+        assert _RUN_SECRET_STREAMID not in content

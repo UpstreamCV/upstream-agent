@@ -16,6 +16,10 @@ Three subcommands today:
   FFmpeg/SRT/H264, obtains an approved SRT URL via the API flow,
   validates the URL, builds the FFmpeg command Milestone 5 will
   execute, then stops the temporary session. Does not stream.
+* ``upstream run`` — live streaming. Opens the camera, requests a
+  stream session, launches FFmpeg, and pipes BGR frames over SRT
+  until ``Ctrl+C``. Cleanly stops FFmpeg, releases the camera, and
+  stops the API session on exit.
 
 ``--version`` prints the package version and exits.
 
@@ -45,6 +49,7 @@ from upstream_agent.diagnostics.streaming import (
 from upstream_agent.errors import UpstreamError
 from upstream_agent.logging_setup import redact_token, setup_logging
 from upstream_agent.state import State, default_state_path, load_state, save_state
+from upstream_agent.supervisor import run_agent
 from upstream_agent.version import __version__
 
 app = typer.Typer(
@@ -407,3 +412,72 @@ def check_cmd(
 
     if not overall_ok:
         raise typer.Exit(code=1)
+
+
+@app.command("run")
+def run_cmd(
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Override the config file path (default: ~/.upstream/config.yaml).",
+    ),
+) -> None:
+    """Stream video to UpStream. Press Ctrl+C to stop."""
+
+    config_path = resolve_config_path(config)
+    if not config_path.exists():
+        typer.echo(f"No config found at {config_path}.", err=True)
+        typer.echo("Run 'upstream init' to create one.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        cfg = load_config(config_path, allow_placeholder=True)
+    except UpstreamError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    if cfg.api.is_placeholder_token:
+        typer.echo(
+            "Error: API token is still a placeholder. Edit "
+            f"{config_path} (api.token) and re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    sensitive = (
+        {cfg.api.token}
+        if cfg.api.token and not cfg.api.is_placeholder_token
+        else set()
+    )
+    setup_logging(
+        level=cfg.logging.level,
+        log_dir=_default_log_dir(),
+        sensitive_values=sensitive,
+    )
+
+    state = load_state(default_state_path())
+
+    def _persist_run(updated: State) -> None:
+        save_state(updated, default_state_path())
+
+    def _on_event(stage: str, message: str) -> None:
+        typer.echo(message)
+
+    typer.echo("Starting UpStream agent...")
+    try:
+        _result, updated_state = run_agent(
+            cfg,
+            state,
+            save_progress=_persist_run,
+            on_event=_on_event,
+        )
+    except KeyboardInterrupt:
+        # The supervisor's finally block already cleaned up and emitted
+        # the shutdown lines; just exit 0.
+        save_state(load_state(default_state_path()), default_state_path())
+        raise typer.Exit(code=0) from None
+    except UpstreamError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    save_state(updated_state, default_state_path())

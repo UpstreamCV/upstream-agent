@@ -102,3 +102,23 @@ class SrtUrlError(UpstreamError):
 
 class CommandBuildError(UpstreamError):
     """Raised when the FFmpeg command line cannot be built from approved config."""
+
+
+class StreamingRuntimeError(UpstreamError):
+    """Base class for failures that surface while the streaming runtime is active."""
+
+
+class FfmpegRuntimeError(StreamingRuntimeError):
+    """Base class for errors raised by the FFmpeg subprocess wrapper."""
+
+
+class FfmpegStartError(FfmpegRuntimeError):
+    """Raised when the FFmpeg subprocess cannot be launched."""
+
+
+class FfmpegWriteError(FfmpegRuntimeError):
+    """Raised when writing a frame to FFmpeg's stdin pipe fails."""
+
+
+class FfmpegExitError(FfmpegRuntimeError):
+    """Raised when FFmpeg exits unexpectedly while the runtime is streaming."""
