@@ -1,16 +1,23 @@
 """Tests for :class:`upstream_agent.api.client.UpstreamApiClient`.
 
-Strategy: build a small ``httpx.MockTransport`` that:
+Strategy: build a small ``httpx.MockTransport`` that captures each
+request (method, path, headers, body) on a list and returns a
+scripted response per call. Lets us assert exactly what got sent
+without standing up a real server or pulling in a mocking library.
 
-* captures each request (method, path, headers, body) on a list, and
-* returns a scripted response per call.
-
-This lets the test assert exactly what got sent without standing up a
-real server or pulling in a mocking library.
+These tests cover the **confirmed** backend contract (M3.2):
+- Agent register payload uses ``name``, ``version``, ``os``,
+  ``python_version``, ``capabilities`` (NOT ``device_id``).
+- Camera register uses ``external_id``, ``device_path``, ``default_*``
+  fields.
+- Stream session uses nested ``requested``.
+- Error envelope is ``{"error": {"code", "message", "details",
+  "request_id"}}``.
 """
 
 from __future__ import annotations
 
+import json as _json
 from collections.abc import Callable
 
 import httpx
@@ -20,11 +27,13 @@ from upstream_agent.api.client import (
     AGENT_REGISTER_PATH,
     CAMERA_REGISTER_PATH,
     STREAM_SESSION_START_PATH,
+    STREAM_SESSION_STOP_PATH_TEMPLATE,
     UpstreamApiClient,
 )
 from upstream_agent.api.schemas import (
     AgentRegisterRequest,
     CameraRegisterRequest,
+    RequestedStreamConfig,
     StreamSessionRequest,
 )
 from upstream_agent.errors import (
@@ -34,12 +43,13 @@ from upstream_agent.errors import (
     ApiError,
     ApiRateLimitError,
     ApiServerError,
+    ApiTokenExpiredError,
     ApiTokenRevokedError,
     ApiValidationError,
 )
 
 BASE_URL = "http://api.test.local"
-TOKEN = "sk_live_abcd1234_doNOT_leak"
+TOKEN = "ups_test_abcd1234_doNOT_leak_xxxxx"
 
 
 class CapturingTransport:
@@ -73,34 +83,87 @@ def _make_client(
     return client, cap
 
 
+# Sample happy-path response bodies matching the confirmed contract.
+_AGENT_RESPONSE_BODY = {
+    "agent": {
+        "id": "0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e",
+        "account_id": "00000000-0000-0000-0000-000000000001",
+        "name": "upstream-agent-12345678",
+        "version": "0.1.0",
+        "os": "darwin",
+        "python_version": "3.12.13",
+        "capabilities": {"ffmpeg": False, "srt": False},
+        "status": "active",
+    },
+    "server_time": "2026-05-13T02:00:00Z",
+}
+
+
+def _agent_req() -> AgentRegisterRequest:
+    return AgentRegisterRequest(
+        name="upstream-agent-12345678",
+        hostname=None,
+        version="0.1.0",
+        os="darwin",
+        python_version="3.12.13",
+        capabilities={"ffmpeg": False, "srt": False},
+    )
+
+
+def _camera_req() -> CameraRegisterRequest:
+    return CameraRegisterRequest(
+        agent_id="agent-1",
+        name="Front Door",
+        external_id="webcam-0",
+        device_path="webcam:0",
+        default_width=1280,
+        default_height=720,
+        default_fps=30,
+        default_codec="h264",
+        default_bitrate_kbps=3000,
+        default_latency_mode="balanced",
+        metadata={},
+    )
+
+
+def _session_req() -> StreamSessionRequest:
+    return StreamSessionRequest(
+        camera_id="cam-1",
+        requested=RequestedStreamConfig(
+            width=1280,
+            height=720,
+            fps=30,
+            codec="h264",
+            bitrate_kbps=3000,
+            latency_mode="balanced",
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
-# Happy paths
+# Agent register happy path
 # ---------------------------------------------------------------------------
 
 
 def test_register_agent_happy_path_returns_parsed_response() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"agent_id": "agent_123"})
+        return httpx.Response(200, json=_AGENT_RESPONSE_BODY)
 
     client, _ = _make_client(handler)
     with client:
-        resp = client.register_agent(
-            AgentRegisterRequest(
-                device_id="dev_1", agent_version="0.1.0", platform="Darwin"
-            )
-        )
-    assert resp.agent_id == "agent_123"
+        resp = client.register_agent(_agent_req())
+    assert resp.agent.id == "0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e"
+    assert resp.agent.account_id == "00000000-0000-0000-0000-000000000001"
+    assert resp.server_time == "2026-05-13T02:00:00Z"
 
 
 def test_register_agent_uses_post_and_correct_path() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"agent_id": "agent_1"})
+        return httpx.Response(200, json=_AGENT_RESPONSE_BODY)
 
     client, cap = _make_client(handler)
     with client:
-        client.register_agent(
-            AgentRegisterRequest(device_id="dev_1", agent_version="0.1.0")
-        )
+        client.register_agent(_agent_req())
     assert len(cap.requests) == 1
     assert cap.requests[0].method == "POST"
     assert cap.requests[0].url.path == AGENT_REGISTER_PATH
@@ -108,133 +171,335 @@ def test_register_agent_uses_post_and_correct_path() -> None:
 
 def test_register_agent_sends_bearer_authorization_header() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"agent_id": "agent_1"})
+        return httpx.Response(200, json=_AGENT_RESPONSE_BODY)
 
     client, cap = _make_client(handler)
     with client:
-        client.register_agent(
-            AgentRegisterRequest(device_id="dev_1", agent_version="0.1.0")
-        )
+        client.register_agent(_agent_req())
     auth = cap.requests[0].headers.get("Authorization")
     assert auth == f"Bearer {TOKEN}"
 
 
-def test_request_omits_none_fields_in_body() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        import json as _json
+def test_register_agent_payload_matches_confirmed_shape() -> None:
+    captured: dict[str, object] = {}
 
-        body = _json.loads(req.content)
-        assert "platform" not in body  # platform was None, must be omitted
-        return httpx.Response(200, json={"agent_id": "agent_1"})
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.update(_json.loads(req.content))
+        return httpx.Response(200, json=_AGENT_RESPONSE_BODY)
 
     client, _ = _make_client(handler)
     with client:
-        client.register_agent(
-            AgentRegisterRequest(device_id="dev_1", agent_version="0.1.0")
-        )
+        client.register_agent(_agent_req())
+
+    assert captured["name"] == "upstream-agent-12345678"
+    assert captured["version"] == "0.1.0"
+    assert captured["os"] == "darwin"
+    assert captured["python_version"] == "3.12.13"
+    assert captured["capabilities"] == {"ffmpeg": False, "srt": False}
+    # Hostname is None on the model; exclude_none drops it from the wire.
+    assert "hostname" not in captured
 
 
-def test_register_camera_happy_path_uses_correct_path() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"camera_id": "cam_42"})
-
-    client, cap = _make_client(handler)
-    with client:
-        resp = client.register_camera(
-            CameraRegisterRequest(
-                agent_id="agent_1",
-                name="Front Door",
-                source_type="webcam",
-                source=0,
-                requested_width=1280,
-                requested_height=720,
-                requested_fps=30,
-            )
-        )
-    assert resp.camera_id == "cam_42"
-    assert cap.requests[0].url.path == CAMERA_REGISTER_PATH
+# ---------------------------------------------------------------------------
+# Camera register happy path
+# ---------------------------------------------------------------------------
 
 
-def test_start_stream_session_happy_path() -> None:
+def test_register_camera_happy_path_wrapped_response() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
-                "session_id": "sess_99",
-                "approved_config": {
-                    "codec": "h264",
-                    "width": 1280,
-                    "height": 720,
-                    "fps": 30,
-                    "srt_url": "srt://stream.test.local:1935/live/secret",
-                },
+                "camera": {
+                    "id": "cam_42",
+                    "external_id": "webcam-0",
+                    "status": "active",
+                }
             },
         )
 
     client, cap = _make_client(handler)
     with client:
-        resp = client.start_stream_session(
-            StreamSessionRequest(
-                agent_id="agent_1",
-                camera_id="cam_1",
-                source_type="webcam",
-                requested_width=1280,
-                requested_height=720,
-                requested_fps=30,
-            )
+        resp = client.register_camera(_camera_req())
+    assert resp.camera.id == "cam_42"
+    assert resp.camera.external_id == "webcam-0"
+    assert cap.requests[0].url.path == CAMERA_REGISTER_PATH
+
+
+def test_register_camera_happy_path_flat_response() -> None:
+    """Backend may also return camera fields at the top level — the
+    pre-validator unwraps the flat case into ``{"camera": {...}}``."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"id": "cam_flat", "external_id": "webcam-0"}
         )
-    assert resp.session_id == "sess_99"
-    assert resp.approved_config.codec == "h264"
+
+    client, _ = _make_client(handler)
+    with client:
+        resp = client.register_camera(_camera_req())
+    assert resp.camera.id == "cam_flat"
+
+
+def test_register_camera_payload_matches_confirmed_shape() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.update(_json.loads(req.content))
+        return httpx.Response(200, json={"camera": {"id": "cam_1"}})
+
+    client, _ = _make_client(handler)
+    with client:
+        client.register_camera(_camera_req())
+
+    assert captured["agent_id"] == "agent-1"
+    assert captured["external_id"] == "webcam-0"
+    assert captured["device_path"] == "webcam:0"
+    assert captured["default_width"] == 1280
+    assert captured["default_codec"] == "h264"
+    assert captured["default_bitrate_kbps"] == 3000
+    assert captured["default_latency_mode"] == "balanced"
+    assert captured["metadata"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Stream session happy path
+# ---------------------------------------------------------------------------
+
+
+_SESSION_RESPONSE_BODY = {
+    "session": {
+        "id": "sess_99",
+        "account_id": "00000000-0000-0000-0000-000000000001",
+        "agent_id": "agent-1",
+        "camera_id": "cam-1",
+        "state": "approved",
+        "srt_url": "srt://ingest.test.local:8890?streamid=publish:abc",
+        "streamid": "publish:abc",
+        "expires_at": "2026-05-13T06:00:00Z",
+        "requested": {
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "codec": "h264",
+            "bitrate_kbps": 3000,
+            "latency_mode": "balanced",
+        },
+        "approved": {
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "codec": "h264",
+            "bitrate_kbps": 3000,
+            "latency_mode": "balanced",
+        },
+    },
+    "srt_url": "srt://ingest.test.local:8890?streamid=publish:abc",
+    "session_token": "eyJhbGciOiJIUzI1NiI.fakejwt.payload",
+    "expires_at": "2026-05-13T06:00:00Z",
+}
+
+
+def test_start_stream_session_happy_path_parses_nested_session() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_SESSION_RESPONSE_BODY)
+
+    client, cap = _make_client(handler)
+    with client:
+        resp = client.start_stream_session(_session_req())
+
+    assert resp.session.id == "sess_99"
+    assert resp.session.state == "approved"
+    assert resp.session.approved is not None
+    assert resp.session.approved.bitrate_kbps == 3000
+    assert resp.session.approved.latency_mode == "balanced"
+    assert resp.srt_url is not None  # carried, never logged
+    assert resp.session_token is not None
     assert cap.requests[0].url.path == STREAM_SESSION_START_PATH
 
 
-# ---------------------------------------------------------------------------
-# Error status mapping
-# ---------------------------------------------------------------------------
+def test_start_stream_session_payload_nests_requested() -> None:
+    captured: dict[str, object] = {}
 
-
-def _agent_req() -> AgentRegisterRequest:
-    return AgentRegisterRequest(device_id="dev_1", agent_version="0.1.0")
-
-
-def test_401_without_token_revoked_code_raises_auth_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": "bad token"})
+        captured.update(_json.loads(req.content))
+        return httpx.Response(200, json=_SESSION_RESPONSE_BODY)
+
+    client, _ = _make_client(handler)
+    with client:
+        client.start_stream_session(_session_req())
+
+    assert captured["camera_id"] == "cam-1"
+    assert isinstance(captured["requested"], dict)
+    requested = captured["requested"]
+    assert requested["codec"] == "h264"
+    assert requested["bitrate_kbps"] == 3000
+    assert requested["latency_mode"] == "balanced"
+
+
+# ---------------------------------------------------------------------------
+# Stop stream session
+# ---------------------------------------------------------------------------
+
+
+def test_stop_stream_session_uses_interpolated_path_and_empty_body() -> None:
+    captured_path: dict[str, str] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured_path["path"] = req.url.path
+        captured_path["method"] = req.method
+        captured_path["body"] = req.content.decode("utf-8") if req.content else ""
+        return httpx.Response(200, json={})
+
+    client, cap = _make_client(handler)
+    with client:
+        client.stop_stream_session("sess_42")
+
+    expected = STREAM_SESSION_STOP_PATH_TEMPLATE.format(session_id="sess_42")
+    assert captured_path["path"] == expected
+    assert captured_path["method"] == "POST"
+    # Empty model serialises to {}.
+    assert captured_path["body"] == "{}"
+    # Bearer header still attached.
+    assert cap.requests[0].headers.get("Authorization") == f"Bearer {TOKEN}"
+
+
+def test_stop_stream_session_returns_parsed_response_for_any_body() -> None:
+    """The response model is permissive — empty / wrapped / arbitrary
+    shapes must all parse."""
+
+    bodies = [{}, {"session": {"id": "sess_1", "state": "stopped"}}, {"foo": "bar"}]
+    for body in bodies:
+        def handler(req: httpx.Request, _b: dict = body) -> httpx.Response:
+            return httpx.Response(200, json=_b)
+
+        client, _ = _make_client(handler)
+        with client:
+            # Should not raise — the model accepts anything.
+            client.stop_stream_session("sess_1")
+
+
+def test_stop_stream_session_404_maps_to_validation_error() -> None:
+    """If the session has already expired server-side, the stop call
+    may return 404. Same mapping as other 404s."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json=_error_body("session_not_found"))
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiValidationError):
+        client.stop_stream_session("sess_missing")
+
+
+def test_stop_stream_session_5xx_maps_to_server_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json=_error_body("unavailable"))
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiServerError):
+        client.stop_stream_session("sess_x")
+
+
+# ---------------------------------------------------------------------------
+# Error envelope mapping (confirmed shape)
+# ---------------------------------------------------------------------------
+
+
+def _error_body(code: str, message: str = "msg", request_id: str = "rid_001") -> dict:
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": {},
+            "request_id": request_id,
+        }
+    }
+
+
+def test_401_invalid_token_maps_to_auth_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json=_error_body("invalid_token"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiAuthError) as excinfo:
         client.register_agent(_agent_req())
-    # And not the more specific subclass:
+    assert "code=invalid_token" in str(excinfo.value)
+    assert "request_id=rid_001" in str(excinfo.value)
+    # Not the more specific subclasses:
     assert not isinstance(excinfo.value, ApiTokenRevokedError)
+    assert not isinstance(excinfo.value, ApiTokenExpiredError)
 
 
-def test_401_with_token_revoked_code_raises_token_revoked_error() -> None:
+def test_401_token_revoked_maps_to_token_revoked_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            401,
-            json={"error_code": "token_revoked", "error": "token revoked"},
-        )
+        return httpx.Response(401, json=_error_body("token_revoked"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiTokenRevokedError) as excinfo:
         client.register_agent(_agent_req())
-    # Subclass relationship preserved:
     assert isinstance(excinfo.value, ApiAuthError)
+    assert "code=token_revoked" in str(excinfo.value)
 
 
-def test_403_maps_to_auth_error() -> None:
+def test_401_token_expired_maps_to_token_expired_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"error": "forbidden"})
+        return httpx.Response(401, json=_error_body("token_expired"))
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiTokenExpiredError) as excinfo:
+        client.register_agent(_agent_req())
+    assert isinstance(excinfo.value, ApiAuthError)
+    assert "code=token_expired" in str(excinfo.value)
+
+
+def test_403_limit_exceeded_maps_to_validation_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = _error_body(
+            "limit_exceeded.max_cameras",
+            message="Camera slot limit reached: 3 of 3.",
+        )
+        # Test data details — included to confirm we don't leak them.
+        body["error"]["details"] = {"in_use": 3, "max": 3}
+        return httpx.Response(403, json=body)
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiValidationError) as excinfo:
+        client.register_camera(_camera_req())
+    assert "code=limit_exceeded.max_cameras" in str(excinfo.value)
+    assert "request_id=" in str(excinfo.value)
+
+
+def test_403_without_limit_code_maps_to_auth_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json=_error_body("forbidden"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiAuthError):
         client.register_agent(_agent_req())
 
 
-@pytest.mark.parametrize("status", [400, 422])
-def test_4xx_validation_codes_map_to_validation_error(status: int) -> None:
+def test_404_camera_not_found_maps_to_validation_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(status, json={"error": "bad request"})
+        return httpx.Response(404, json=_error_body("camera_not_found"))
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiValidationError):
+        client.start_stream_session(_session_req())
+
+
+def test_409_camera_already_streaming_maps_to_validation_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json=_error_body("camera_already_streaming"))
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiValidationError):
+        client.start_stream_session(_session_req())
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_400_422_validation_codes_map_to_validation_error(status: int) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=_error_body("validation"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiValidationError):
@@ -243,7 +508,7 @@ def test_4xx_validation_codes_map_to_validation_error(status: int) -> None:
 
 def test_429_maps_to_rate_limit_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, json={"error": "slow down"})
+        return httpx.Response(429, json=_error_body("rate_limited"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiRateLimitError):
@@ -252,22 +517,48 @@ def test_429_maps_to_rate_limit_error() -> None:
 
 def test_503_maps_to_server_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": "unavailable"})
+        return httpx.Response(503, json=_error_body("unavailable"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiServerError):
         client.register_agent(_agent_req())
 
 
-def test_404_maps_to_bare_api_error() -> None:
+def test_unmapped_4xx_maps_to_bare_api_error() -> None:
+    """A 418 with no recognised code should fall through to bare ApiError."""
+
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(418, json=_error_body("teapot"))
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiError) as excinfo:
         client.register_agent(_agent_req())
-    # Not one of the specific subclasses:
     assert type(excinfo.value) is ApiError
+
+
+def test_error_envelope_missing_fields_still_raises_typed_error() -> None:
+    """Bodies without ``error.code`` / ``error.message`` should still
+    produce a typed error; the formatted message gracefully omits the
+    missing pieces."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={})
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiRateLimitError) as excinfo:
+        client.register_agent(_agent_req())
+    # No "code=" segment because no code was present.
+    assert "code=" not in str(excinfo.value)
+
+
+def test_error_envelope_non_dict_still_raises_typed_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"<html>boom</html>")
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiServerError) as excinfo:
+        client.register_agent(_agent_req())
+    assert "500" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -300,23 +591,34 @@ def test_read_timeout_maps_to_api_connection_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_response_missing_required_field_raises_contract_error() -> None:
+def test_agent_response_missing_id_raises_contract_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"unrelated": "value"})
+        return httpx.Response(200, json={"agent": {"name": "x"}})
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiContractError) as excinfo:
         client.register_agent(_agent_req())
-    assert "agent_id" in str(excinfo.value)
+    assert "id" in str(excinfo.value).lower()
 
 
-def test_response_with_blank_required_field_raises_contract_error() -> None:
+def test_agent_response_blank_id_raises_contract_error() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"agent_id": ""})
+        return httpx.Response(200, json={"agent": {"id": ""}})
 
     client, _ = _make_client(handler)
     with client, pytest.raises(ApiContractError):
         client.register_agent(_agent_req())
+
+
+def test_session_response_missing_session_id_raises_contract_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = dict(_SESSION_RESPONSE_BODY)
+        body["session"] = {k: v for k, v in body["session"].items() if k != "id"}
+        return httpx.Response(200, json=body)
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiContractError):
+        client.start_stream_session(_session_req())
 
 
 def test_non_json_response_body_raises_contract_error() -> None:
@@ -335,7 +637,7 @@ def test_non_json_response_body_raises_contract_error() -> None:
 
 def test_token_does_not_appear_in_any_error_message() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": "denied"})
+        return httpx.Response(401, json=_error_body("invalid_token"))
 
     client, _ = _make_client(handler)
     with client:
@@ -356,28 +658,25 @@ def test_token_does_not_appear_in_connection_error_message() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle
+# Lifecycle / base URL
 # ---------------------------------------------------------------------------
 
 
 def test_client_close_is_safe_to_call() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"agent_id": "x"})
+        return httpx.Response(200, json=_AGENT_RESPONSE_BODY)
 
     client, _ = _make_client(handler)
     client.close()
-    # Calling close again should not raise.
     client.close()
 
 
 def test_from_config_builds_client() -> None:
     from upstream_agent.config import ApiConfig
 
-    cfg = ApiConfig(base_url="https://example.test", token="sk_test_abcd")
+    cfg = ApiConfig(base_url="https://example.test", token="ups_test_abcd")
     client = UpstreamApiClient.from_config(cfg)
     try:
-        # Trust normalisation happens during __init__:
-        # base_url stored without trailing slash.
         assert client._base_url == "https://example.test"
     finally:
         client.close()
@@ -385,7 +684,7 @@ def test_from_config_builds_client() -> None:
 
 def test_base_url_trailing_slash_is_normalised() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"agent_id": "agent_1"})
+        return httpx.Response(200, json=_AGENT_RESPONSE_BODY)
 
     cap = CapturingTransport()
     transport = cap.respond_with(handler)
@@ -396,6 +695,4 @@ def test_base_url_trailing_slash_is_normalised() -> None:
         client.register_agent(_agent_req())
     finally:
         client.close()
-    # The path observed by the transport must not start with a doubled
-    # slash even though the base_url ended with one.
     assert cap.requests[0].url.path == AGENT_REGISTER_PATH

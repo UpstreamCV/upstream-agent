@@ -413,6 +413,7 @@ def test_check_camera_fps_unknown_when_driver_reports_zero(
 
 
 _API_SECRET_SRT_URL = "srt://stream.test.local:1935/live/CLI_TEST_SECRET_STREAM_TOKEN"
+_API_SECRET_SESSION_TOKEN = "eyJhbGciOiJIUzI1NiI.CLI_TEST_SECRET_JWT.signature"
 
 
 def _install_fake_api_client(
@@ -424,6 +425,7 @@ def _install_fake_api_client(
     camera_raises: Exception | None = None,
     session_response: dict | None = None,
     session_raises: Exception | None = None,
+    stop_raises: Exception | None = None,
 ) -> dict:
     """Install a fake UpstreamApiClient on the diagnostics module.
 
@@ -432,30 +434,52 @@ def _install_fake_api_client(
     """
 
     from upstream_agent.api.schemas import (
+        Agent,
         AgentRegisterResponse,
         ApprovedStreamConfig,
+        Camera,
         CameraRegisterResponse,
+        RequestedStreamConfig,
+        Session,
+        StopStreamSessionResponse,
         StreamSessionResponse,
     )
     from upstream_agent.diagnostics import api as api_module
 
-    default_agent = AgentRegisterResponse(agent_id="agent_123")
-    default_camera = CameraRegisterResponse(camera_id="cam_456")
+    default_agent = AgentRegisterResponse(
+        agent=Agent(id="agent_123", name="upstream-agent-12345678", status="active"),
+        server_time="2026-05-13T02:00:00Z",
+    )
+    default_camera = CameraRegisterResponse(
+        camera=Camera(id="cam_456", external_id="webcam-0", status="active")
+    )
+    _approved_kwargs = dict(
+        width=1280,
+        height=720,
+        fps=30,
+        codec="h264",
+        bitrate_kbps=3000,
+        latency_mode="balanced",
+    )
     default_session = StreamSessionResponse(
-        session_id="sess_789",
-        approved_config=ApprovedStreamConfig(
-            codec="h264",
-            width=1280,
-            height=720,
-            fps=30,
+        session=Session(
+            id="sess_789",
+            state="approved",
             srt_url=_API_SECRET_SRT_URL,
+            streamid="publish:secret",
+            requested=RequestedStreamConfig(**_approved_kwargs),
+            approved=ApprovedStreamConfig(**_approved_kwargs),
         ),
+        srt_url=_API_SECRET_SRT_URL,
+        session_token=_API_SECRET_SESSION_TOKEN,
+        expires_at="2026-05-13T06:00:00Z",
     )
 
     captures: dict = {
         "agent_calls": 0,
         "camera_calls": 0,
         "session_calls": 0,
+        "stop_calls": [],
         "factory_called_with_base_url": None,
     }
 
@@ -490,6 +514,12 @@ def _install_fake_api_client(
                 return StreamSessionResponse.model_validate(session_response)
             return default_session
 
+        def stop_stream_session(self, session_id: str) -> object:
+            captures["stop_calls"].append(session_id)
+            if stop_raises is not None:
+                raise stop_raises
+            return StopStreamSessionResponse()
+
     def fake_factory(cfg):  # type: ignore[no-untyped-def]
         captures["factory_called_with_base_url"] = cfg.base_url
         return FakeClient()
@@ -517,7 +547,7 @@ def test_check_api_happy_path_prints_block_and_saves_state(
     home_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_camera_config(home_dir, token="real_token_value_xyz")
-    _install_fake_api_client(monkeypatch)
+    captures = _install_fake_api_client(monkeypatch)
 
     result = runner.invoke(app, ["check", "--api"])
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -525,8 +555,17 @@ def test_check_api_happy_path_prints_block_and_saves_state(
     assert "Agent registered: agent_123" in result.stdout
     assert "Camera registered: cam_456" in result.stdout
     assert "Stream session approved: sess_789" in result.stdout
-    assert "Approved config: h264, 1280x720 @ 30 FPS" in result.stdout
+    assert (
+        "Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced"
+        in result.stdout
+    )
     assert "SRT URL received: yes" in result.stdout
+    # account_id is intentionally NOT shown in CLI output.
+    assert "account_id" not in result.stdout
+    # No stop warning on the happy path.
+    assert "Warning" not in result.stderr
+    # And the cleanup stop was called with the approved session id.
+    assert captures["stop_calls"] == ["sess_789"]
 
     state_file = home_dir / ".upstream" / "agent_state.json"
     assert state_file.exists()
@@ -598,10 +637,10 @@ def test_check_api_session_failure_persists_both_ids(
     assert state["last_camera_id"] == "cam_456"
 
 
-def test_check_api_does_not_leak_token_or_srt_url(
+def test_check_api_does_not_leak_token_srt_url_or_session_token(
     home_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    secret_token = "sk_live_abcd_must_not_leak_zzz"
+    secret_token = "ups_live_abcd_must_not_leak_zzz"
     _write_camera_config(home_dir, token=secret_token)
     _install_fake_api_client(monkeypatch)
 
@@ -611,13 +650,37 @@ def test_check_api_does_not_leak_token_or_srt_url(
     assert secret_token not in result.stderr
     assert _API_SECRET_SRT_URL not in result.stdout
     assert _API_SECRET_SRT_URL not in result.stderr
+    assert _API_SECRET_SESSION_TOKEN not in result.stdout
+    assert _API_SECRET_SESSION_TOKEN not in result.stderr
+    # streamid must not appear either.
+    assert "publish:secret" not in result.stdout
+    assert "publish:secret" not in result.stderr
 
-    # Log file must not carry the token or full URL either.
+    # Log file must not carry any of these either.
     log_file = home_dir / ".upstream" / "logs" / "agent.log"
     if log_file.exists():
         content = log_file.read_text(encoding="utf-8")
         assert secret_token not in content
         assert _API_SECRET_SRT_URL not in content
+        assert _API_SECRET_SESSION_TOKEN not in content
+        assert "publish:secret" not in content
+
+
+def test_check_api_succeeds_with_flat_camera_response(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backend may return a flat {id: ..., name: ...} for cameras; the
+    pre-validator on CameraRegisterResponse must accept both shapes."""
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_api_client(
+        monkeypatch,
+        camera_response={"id": "cam_flat_777", "external_id": "webcam-0"},
+    )
+
+    result = runner.invoke(app, ["check", "--api"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Camera registered: cam_flat_777" in result.stdout
 
 
 def test_check_camera_and_api_both_flags_runs_both(
@@ -635,3 +698,58 @@ def test_check_camera_and_api_both_flags_runs_both(
     cam_idx = result.stdout.index("Camera opened successfully")
     api_idx = result.stdout.index("API check successful")
     assert cam_idx < api_idx
+
+
+def test_check_api_stop_failure_is_non_fatal_warning(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If stop fails after a successful start, the CLI prints the
+    success block, adds a warning line on stderr, and exits 0 — the
+    *check* itself succeeded."""
+
+    from upstream_agent.errors import ApiServerError
+
+    secret_token = "ups_live_must_not_leak_in_stop_warning"
+    _write_camera_config(home_dir, token=secret_token)
+    _install_fake_api_client(
+        monkeypatch,
+        stop_raises=ApiServerError("backend stop overloaded"),
+    )
+
+    result = runner.invoke(app, ["check", "--api"])
+
+    # Exit 0 — the check succeeded.
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Success block still printed.
+    assert "API check successful" in result.stdout
+    assert "Stream session approved: sess_789" in result.stdout
+    # And a warning on stderr.
+    assert "Warning: failed to stop stream session" in result.stderr
+    assert "overloaded" in result.stderr
+    # No secret leaked through the warning path.
+    assert secret_token not in result.stderr
+    assert secret_token not in result.stdout
+    assert _API_SECRET_SRT_URL not in result.stderr
+    assert _API_SECRET_SRT_URL not in result.stdout
+    assert _API_SECRET_SESSION_TOKEN not in result.stderr
+    assert _API_SECRET_SESSION_TOKEN not in result.stdout
+
+
+def test_check_api_back_to_back_runs_both_succeed(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running ``upstream check --api`` twice in a row must both
+    succeed. With cleanup-stop in place, the second run no longer
+    hits ``camera_already_streaming``."""
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    captures = _install_fake_api_client(monkeypatch)
+
+    first = runner.invoke(app, ["check", "--api"])
+    assert first.exit_code == 0, first.stdout + first.stderr
+
+    second = runner.invoke(app, ["check", "--api"])
+    assert second.exit_code == 0, second.stdout + second.stderr
+
+    # Stop was called once per run.
+    assert captures["stop_calls"] == ["sess_789", "sess_789"]

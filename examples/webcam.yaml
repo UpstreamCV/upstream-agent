@@ -6,7 +6,10 @@
 # DO NOT commit your filled-in config to any git repo, public or private.
 
 api:
-  base_url: "https://api.upstream.ai"
+  # Production / staging: "https://api.upstreamcv.com"
+  # Local dev:            "http://localhost:4000"
+  base_url: "https://api.upstreamcv.com"
+  # Tokens look like: ups_<env>_<8-char id>_<22-char secret>
   token: "YOUR_API_TOKEN_HERE"
 
 camera:
@@ -19,7 +22,7 @@ camera:
   requested_fps: 30
 
 stream:
-  # "low" prioritises latency, "quality" prioritises image fidelity,
+  # "low" prioritises latency, "stable" prioritises steady throughput,
   # "balanced" is a reasonable default for most setups.
   latency_mode: "balanced"
   buffer_ms: 500

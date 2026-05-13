@@ -210,7 +210,9 @@ def _print_api_check_success(result: ApiCheckResult) -> None:
     typer.echo(
         f"Approved config: {result.approved_codec}, "
         f"{result.approved_width}x{result.approved_height} @ "
-        f"{result.approved_fps} FPS"
+        f"{result.approved_fps} FPS, "
+        f"{result.approved_bitrate_kbps} kbps, "
+        f"{result.approved_latency_mode}"
     )
     typer.echo(
         f"SRT URL received: {'yes' if result.srt_url_present else 'no'}"
@@ -314,6 +316,15 @@ def check_cmd(
             overall_ok = False
         else:
             _print_api_check_success(api_result)
+            if api_result.stop_warning is not None:
+                # Cleanup stop failed. The check itself succeeded, so
+                # exit stays 0 — but warn the operator so they know
+                # the session may linger until it expires.
+                typer.echo(
+                    f"Warning: failed to stop stream session after check: "
+                    f"{api_result.stop_warning}",
+                    err=True,
+                )
 
     if not overall_ok:
         raise typer.Exit(code=1)

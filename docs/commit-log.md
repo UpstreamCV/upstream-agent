@@ -32,6 +32,114 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-12 - feat: cleanup stop session after upstream check --api (Milestone 3.3)
+
+### Summary
+Real-backend smoke during M3.2 surfaced a UX bug: `upstream check --api` started an approved stream session and never released it, so a second back-to-back run hit `409 camera_already_streaming`. M3.3 adds a cleanup-stop step: after a successful `start_stream_session`, the orchestrator calls `POST /v1/stream-sessions/{session_id}/stop`. The check is now safely re-runnable.
+
+Stop failures are **non-fatal** — registration and session approval already prove the path works. A failing stop becomes a `Warning:` line on stderr; the command still exits 0.
+
+### Files touched
+- upstream_agent/api/schemas.py - added `StopStreamSessionRequest` (empty, `extra="forbid"`) and `StopStreamSessionResponse` (permissive, no required fields).
+- upstream_agent/api/client.py - added `STREAM_SESSION_STOP_PATH_TEMPLATE = "/v1/stream-sessions/{session_id}/stop"` and `stop_stream_session(session_id)`. The method interpolates the path and sends an empty body. Re-uses `_request` so it benefits from the same status / code / contract error mapping.
+- upstream_agent/api/__init__.py - re-exports the new path template and the two new schemas.
+- upstream_agent/diagnostics/api.py - added a step 4 cleanup-stop inside the `with factory(...) as client` block. The call is wrapped in `try/except ApiError`; on failure, the exception string lands on `result.stop_warning` and `result.success` stays True. `ApiCheckResult` gained a `stop_warning: str | None` field; the `_failure` helper sets it to None for steps 1–3 failures.
+- upstream_agent/cli.py - after `_print_api_check_success`, if `result.stop_warning is not None`, print `Warning: failed to stop stream session after check: <msg>` to stderr. Exit stays 0.
+- tests/test_api_client.py - 4 new tests: stop uses the interpolated path with `POST` and an empty body; response model accepts any shape (empty / wrapped / arbitrary); 404 → `ApiValidationError`; 5xx → `ApiServerError`.
+- tests/test_diagnostics_api.py - `FakeUpstreamApiClient` gained `stop_response` / `stop_raises` and a `stop_session_calls` list. Updated assertions on the happy path and on the session-start-failure path. Two new tests: stop failure surfaces as `result.stop_warning` with `result.success=True`; the orchestrator stops the *correct* session id when the server returns one different from the default.
+- tests/test_cli.py - `_install_fake_api_client` gained `stop_raises` and a `stop_calls` capture list. Happy-path test asserts the cleanup stop was called with `sess_789` and that no warning appears on stderr. New test for the stop-failure path (exit 0, success block printed, warning on stderr, no token / SRT URL / session_token leakage). New back-to-back test that asserts both runs exit 0 and stop is called once per run.
+- docs/api-contracts.md - added a `POST /v1/stream-sessions/{session_id}/stop` section documenting the path-interpolated endpoint, the empty-body request, the permissive-response policy, and the non-fatal warning behavior.
+- docs/troubleshooting.md - added "Warning: failed to stop stream session after check" entry, plus a "Running back-to-back" entry explaining the expected behavior.
+- README.md - extended the "Verifying API registration" section: lists step 4 (cleanup stop), notes that twice-in-a-row should succeed, and explains the warning-without-failure behavior.
+
+### Functions/classes changed
+- `StopStreamSessionRequest` / `StopStreamSessionResponse` - new schemas. Request is empty (`{}`); response accepts any shape so future server-side changes don't break the agent.
+- `UpstreamApiClient.stop_stream_session(session_id)` - new public method. Interpolates `STREAM_SESSION_STOP_PATH_TEMPLATE`, sends an empty body, returns a parsed response (mostly unused by callers).
+- `ApiCheckResult.stop_warning` - new field. Only ever set on otherwise-successful results; `None` on failures (which have their own `error` / `failed_step`).
+- `run_api_check` - now performs the stop call inside the same context manager as the start call. The stop sits *outside* the three numbered failure points; an exception there cannot flip `success` to False.
+- `check_cmd` (CLI) - prints the success block, then conditionally prints `Warning: failed to stop stream session after check: ...` on stderr. Exit code is unchanged from the success path.
+
+### System interaction notes
+The agent's API-check flow now ends with a `POST /v1/stream-sessions/{session_id}/stop` on the happy path. The session lifecycle on the server is:
+
+1. `start_stream_session` → server creates `state=approved` session, hands back `srt_url` + `session_token`.
+2. **Without the agent ever opening an SRT connection**, the cleanup stop call sets the session to a stopped/expired state on the server.
+3. Subsequent `start_stream_session` calls for the same camera find no active session and succeed.
+
+The agent's local state (`agent_state.json`) is unchanged: still only `agent_id`, `device_id`, `last_camera_id`. Session info is never persisted.
+
+### Testing/checks
+- `pytest -q` passes (155 tests; 147 from M3.2 + 8 new for stop coverage).
+- `ruff check upstream_agent tests` — same 4 pre-existing warnings; no new lint categories.
+- Real-backend smoke: needs a real token to actually verify the back-to-back run on the live server. The mocked back-to-back test (`test_check_api_back_to_back_runs_both_succeed`) verifies the wiring; the live run is the operator's confirmation that the camera slot is genuinely released server-side.
+
+### Follow-up TODOs
+- Real-backend smoke (twice-in-a-row) once a token is plugged into `~/.upstream/config.yaml`.
+- If stop reliably fails in real deployments, escalate to a retry / out-of-band cleanup. Today's "best-effort with warning" is fine because session expiry server-side eventually clears the slot.
+
+---
+
+## 2026-05-12 - feat: align API client with confirmed backend contract (Milestone 3.2)
+
+### Summary
+M3.1 shipped a provisional API client. M3.2 updates every shape to match the backend contract the API teammate just confirmed: new agent-register payload (`name`, `version`, `os`, `python_version`, `capabilities` — NOT `device_id`), wrapped agent response (`{agent: {id, ...}, server_time}`), new camera-register payload (`external_id`, `device_path`, `default_*`, `metadata`), robust camera response (accepts both wrapped and flat shapes), nested stream-session request (`{camera_id, requested: {codec, bitrate_kbps, latency_mode, ...}}`), nested stream-session response (`{session: {id, approved, srt_url, streamid, ...}, srt_url, session_token, expires_at}`), and the new error envelope (`{error: {code, message, details, request_id}}`).
+
+Also tightens privacy: the agent now generates a non-sensitive `name` (`upstream-agent-<8-hex-of-device-id>`) and never sends `platform.node()` as hostname. Camera `external_id` and `device_path` are derived as `webcam-0` / `webcam:0` for stability across OSes.
+
+The CLI surface, state file shape, orchestrator signature, and Typer flags are unchanged — only payloads and error parsing moved.
+
+### Files touched
+- upstream_agent/config.py - `StreamConfig.latency_mode` Literal → `low | balanced | stable`; default `api.base_url` in the template → `https://api.upstreamcv.com`; template comments mention local-dev URL and token format.
+- upstream_agent/errors.py - added `ApiTokenExpiredError(ApiAuthError)`.
+- upstream_agent/api/schemas.py - rewritten. New models: `Agent`, `Camera`, `Session`, `RequestedStreamConfig`, plus refreshed request/response wrappers. `CameraRegisterResponse` carries a `model_validator(mode="before")` that unwraps a flat camera body into `{"camera": {...}}`.
+- upstream_agent/api/client.py - `_parse_error_body` rewritten to read the nested envelope and return a `ParsedError` dataclass with `code`, `message`, `request_id`. `_raise_for_status` rewritten to switch on `(status, code)` — `token_revoked` / `token_expired` codes hit their specific subclasses; `limit_exceeded.*` on 403 maps to `ApiValidationError`; 404 maps to validation. Added `_format_error` helper that produces `"{method} {path} -> {status} {reason}, code=..., request_id=...: {message}"` without leaking bodies. Added `TOKEN_EXPIRED_ERROR_CODE` constant.
+- upstream_agent/api/__init__.py - re-exports updated (`Agent`, `Camera`, `Session`, `RequestedStreamConfig`, `ParsedError`, `TOKEN_EXPIRED_ERROR_CODE`).
+- upstream_agent/diagnostics/api.py - rewritten request builders. Helpers `_agent_name_from(device_id)`, `_camera_external_id(camera_cfg)`, `_camera_device_path(camera_cfg)`. Constants `_DEFAULT_CODEC="h264"`, `_DEFAULT_BITRATE_KBPS=3000`, `_AGENT_CAPABILITIES={"ffmpeg": False, "srt": False}`. `ApiCheckResult` expanded with `approved_bitrate_kbps` and `approved_latency_mode`. Reads agent/camera/session IDs through the new nested response shapes (`agent_resp.agent.id`, `camera_resp.camera.id`, `session_resp.session.id`).
+- upstream_agent/cli.py - `_print_api_check_success` updated to the verbose 6-line block: `Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced`. `account_id` is intentionally not displayed.
+- tests/test_api_client.py - rewritten for the confirmed contract. Adds happy-path payload-shape assertions, wrapped vs flat camera response handling, all error-code mappings (`invalid_token`, `token_revoked`, `token_expired`, `limit_exceeded.*`, `camera_not_found`, `camera_already_streaming`, 400/422/429/5xx, unmapped 4xx, missing-envelope tolerance), and token-leak guards.
+- tests/test_diagnostics_api.py - rewritten with the new `FakeUpstreamApiClient` that returns nested response objects. New assertions: generated agent name format and stability, no hostname sent, lowercased OS, `webcam-0` external_id, `webcam:0` device_path, hard-coded codec/bitrate, latency_mode echoed from config. Leak guards now cover both `srt_url` and `session_token`.
+- tests/test_cli.py - `_install_fake_api_client` helper rewritten to return the new wrapper shapes; added `_API_SECRET_SESSION_TOKEN`. Happy path now asserts the verbose approved-config line and that `account_id` is absent from output. New test: `test_check_api_succeeds_with_flat_camera_response` covers the pre-validator. Token-leak guard extended to streamid and session_token.
+- examples/webcam.yaml, examples/rtsp.yaml - `api.base_url` updated to `https://api.upstreamcv.com`; comments mention local-dev URL and token format; `latency_mode` comment lists `low | balanced | stable`.
+- docs/api-contracts.md - replaced PROVISIONAL with CONFIRMED. Documents both base URLs, token format, confirmed payloads for all three endpoints, the new error envelope, full status/code → typed-error mapping table, and the agent-name privacy decision.
+- docs/architecture.md - "API client" row flipped to "M3 contract confirmed; mocked tests green; real smoke pending". Rewrote the "API client layer" section to reference the confirmed shapes, the privacy decisions, and the `account_id`-not-displayed rule.
+- docs/module-map.md - `errors.py` row now lists `ApiTokenExpiredError`. `api/__init__.py`, `api/client.py`, `api/schemas.py` rows describe the M3.2 surface.
+- docs/troubleshooting.md - added nine confirmed-contract entries (invalid_token, token_revoked, token_expired, limit_exceeded.max_cameras, agent_not_found, agent_account_mismatch, camera_not_found, camera_already_streaming, limit_exceeded.max_concurrent_sessions) plus a "where do I find the request_id" entry.
+- README.md - example `api.base_url` updated to `https://api.upstreamcv.com`; added a local-dev snippet; updated success-output sample to the verbose form; noted the agent-name privacy decision; updated failure-output samples to show the new `code=` / `request_id=` segments.
+
+### Functions/classes changed
+- `Agent`, `Camera`, `Session`, `RequestedStreamConfig`, `ApprovedStreamConfig` - new Pydantic models matching the backend's nested response shapes. `ApprovedStreamConfig.latency_mode` is a plain `str` (not Literal) since the server may evolve.
+- `AgentRegisterRequest` - shape moved from `{device_id, agent_version, platform}` to `{name, hostname, version, os, python_version, capabilities}`. Hostname is optional and intentionally None.
+- `CameraRegisterRequest` - shape moved from `{source_type, source, requested_*}` to `{name, external_id, device_path, default_*, metadata}`.
+- `CameraRegisterResponse` - carries a `model_validator(mode="before")` that unwraps a top-level `{"id": ..., ...}` body into `{"camera": {...}}` so the agent works against either backend shape.
+- `StreamSessionRequest` / `StreamSessionResponse` - flat structure replaced with nested `requested` / `session` blocks.
+- `UpstreamApiClient._parse_error_body` - now returns a `ParsedError(code, message, request_id)`. Switches on the confirmed envelope; tolerates absent or malformed bodies.
+- `UpstreamApiClient._raise_for_status` - new dispatch on `(status, code)`. 401 with `token_revoked` / `token_expired` hits the specific subclasses; 403 with `limit_exceeded.*` becomes `ApiValidationError`; 404 (`agent_not_found`, `camera_not_found`) becomes `ApiValidationError` so the CLI reads naturally.
+- `UpstreamApiClient._format_error` - new helper. Produces messages of the form `"POST /v1/cameras/register -> 403 Forbidden, code=limit_exceeded.max_cameras, request_id=abc: ..."`. Never includes request or response bodies.
+- `run_api_check` - same signature, rewritten internals. Builds the new payloads, reads through nested responses, returns the expanded `ApiCheckResult`.
+- `_agent_name_from(device_id)` / `_camera_external_id(cfg)` / `_camera_device_path(cfg)` - private helpers exposed for unit testing. Stable across runs.
+- `ApiTokenExpiredError(ApiAuthError)` - new error class for the `token_expired` code.
+- `_print_api_check_success` - verbose approved-config line.
+
+### System interaction notes
+The agent flow on `upstream check --api` is unchanged at the CLI level. Internally, every request body and every parsed response now uses the confirmed shapes. State persistence is identical (`agent_id`, `device_id`, `last_camera_id`); `account_id` and session info are never written to state.
+
+The privacy posture is meaningfully better: the customer's real hostname never leaves the machine, the agent's name is reproducible from `device_id`, and the camera's `device_path` is OS-neutral.
+
+The redaction filter remains the second line of defense for accidental token logging by third-party libraries. The first line is the client itself, which emits no request or response bodies. New: `streamid` and `session_token` are also covered by the CLI's leak-guard tests.
+
+### Testing/checks
+- `pytest -q` passes (147 tests; 135 from M1/M2/M3.1 + 12 net new for M3.2 — covering wrapped vs flat camera response, all confirmed error codes, expanded leak guards, and request-payload sanity).
+- `ruff check upstream_agent tests` — same pre-existing 4 warnings (1 I001 in test_token_redaction.py from M1, 3 B008 from Typer's option-default idiom). No new lint categories.
+- All M3.2 tests are mocked (`httpx.MockTransport` for the client; a `FakeUpstreamApiClient` for the orchestrator; a `_default_factory` monkeypatch for CLI). No real backend, no internet, no real token needed for CI.
+- Real-backend smoke against `https://api.upstreamcv.com` or `http://localhost:4000` is the conditional verification step — only runs if a real token is already present in the local config.
+
+### Follow-up TODOs
+- Run real smoke once a dev token is provisioned; record which `CameraRegisterResponse` shape (wrapped vs flat) the backend actually returns.
+- Implement token rotation handling once the backend exposes the rotation signal.
+- Add `--api` flag variants (`--api-config-only`, `--api-no-session`) if operators want a lighter check; the orchestrator can support short-circuiting after any step.
+
+---
+
 ## 2026-05-12 - feat: add API client and upstream check --api (Milestone 3)
 
 ### Summary

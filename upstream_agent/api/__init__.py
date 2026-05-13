@@ -8,24 +8,32 @@ Two layers:
   status codes into typed :class:`~upstream_agent.errors.ApiError`
   subclasses.
 
-Endpoint paths are constants in :mod:`~upstream_agent.api.client` and
-are documented as provisional in ``docs/api-contracts.md`` until the
-backend contract is confirmed.
+Endpoint paths and error codes are confirmed against the backend
+contract in M3.2 (see ``docs/api-contracts.md``).
 """
 
 from upstream_agent.api.client import (
     AGENT_REGISTER_PATH,
     CAMERA_REGISTER_PATH,
     STREAM_SESSION_START_PATH,
+    STREAM_SESSION_STOP_PATH_TEMPLATE,
+    TOKEN_EXPIRED_ERROR_CODE,
     TOKEN_REVOKED_ERROR_CODE,
+    ParsedError,
     UpstreamApiClient,
 )
 from upstream_agent.api.schemas import (
+    Agent,
     AgentRegisterRequest,
     AgentRegisterResponse,
     ApprovedStreamConfig,
+    Camera,
     CameraRegisterRequest,
     CameraRegisterResponse,
+    RequestedStreamConfig,
+    Session,
+    StopStreamSessionRequest,
+    StopStreamSessionResponse,
     StreamSessionRequest,
     StreamSessionResponse,
 )
@@ -34,13 +42,22 @@ __all__ = [
     "AGENT_REGISTER_PATH",
     "CAMERA_REGISTER_PATH",
     "STREAM_SESSION_START_PATH",
+    "STREAM_SESSION_STOP_PATH_TEMPLATE",
+    "TOKEN_EXPIRED_ERROR_CODE",
     "TOKEN_REVOKED_ERROR_CODE",
+    "ParsedError",
     "UpstreamApiClient",
+    "Agent",
     "AgentRegisterRequest",
     "AgentRegisterResponse",
     "ApprovedStreamConfig",
+    "Camera",
     "CameraRegisterRequest",
     "CameraRegisterResponse",
+    "RequestedStreamConfig",
+    "Session",
+    "StopStreamSessionRequest",
+    "StopStreamSessionResponse",
     "StreamSessionRequest",
     "StreamSessionResponse",
 ]

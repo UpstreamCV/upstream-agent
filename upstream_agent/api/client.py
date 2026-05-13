@@ -17,14 +17,16 @@ Logging policy: the client emits **no** request or response bodies
 to logs. Anything that might contain tokens or session URLs stays in
 memory and is discarded after the response is parsed.
 
-Endpoint paths are module-level constants so the eventual swap to a
-finalised backend contract is mechanical. They are documented as
-provisional in ``docs/api-contracts.md``.
+Endpoint paths are module-level constants so any future backend path
+change is a single-line edit. The error-body envelope and code names
+are documented in ``docs/api-contracts.md`` and match the confirmed
+backend contract (M3.2).
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
@@ -35,6 +37,8 @@ from upstream_agent.api.schemas import (
     AgentRegisterResponse,
     CameraRegisterRequest,
     CameraRegisterResponse,
+    StopStreamSessionRequest,
+    StopStreamSessionResponse,
     StreamSessionRequest,
     StreamSessionResponse,
 )
@@ -45,6 +49,7 @@ from upstream_agent.errors import (
     ApiError,
     ApiRateLimitError,
     ApiServerError,
+    ApiTokenExpiredError,
     ApiTokenRevokedError,
     ApiValidationError,
 )
@@ -55,17 +60,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Endpoint paths — PROVISIONAL, pending backend confirmation.
-# See docs/api-contracts.md for the assumed payload shapes.
+# Endpoint paths — CONFIRMED contract. See docs/api-contracts.md.
 AGENT_REGISTER_PATH: str = "/v1/agents/register"
 CAMERA_REGISTER_PATH: str = "/v1/cameras/register"
 STREAM_SESSION_START_PATH: str = "/v1/stream-sessions/start"
+# Path-interpolated. Build with .format(session_id=...).
+STREAM_SESSION_STOP_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}/stop"
 
-# Sentinel error code the backend is assumed to return when a token has
-# been revoked. PROVISIONAL — confirm with backend team.
+# Stable error codes the backend returns inside the error envelope.
 TOKEN_REVOKED_ERROR_CODE: str = "token_revoked"
+TOKEN_EXPIRED_ERROR_CODE: str = "token_expired"
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class ParsedError:
+    """Fields the client extracts from the backend's error envelope.
+
+    Any field may be ``None`` when the body is missing, not JSON, or
+    doesn't match the expected shape — the client still raises a typed
+    error in that case and the formatted message degrades gracefully.
+    """
+
+    code: str | None
+    message: str | None
+    request_id: str | None
 
 
 class UpstreamApiClient:
@@ -140,6 +160,24 @@ class UpstreamApiClient:
             "POST", STREAM_SESSION_START_PATH, req, StreamSessionResponse
         )
 
+    def stop_stream_session(self, session_id: str) -> StopStreamSessionResponse:
+        """Stop the named stream session.
+
+        Called by the API-check diagnostic after a successful
+        ``start_stream_session`` to release the camera so a subsequent
+        check (or any other start) doesn't hit
+        ``camera_already_streaming``.
+
+        The endpoint takes no payload — the session id is on the URL.
+        The agent does not need to inspect the response body; the
+        HTTP 200 is the signal.
+        """
+
+        path = STREAM_SESSION_STOP_PATH_TEMPLATE.format(session_id=session_id)
+        return self._request(
+            "POST", path, StopStreamSessionRequest(), StopStreamSessionResponse
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -203,30 +241,60 @@ class UpstreamApiClient:
             ) from None
 
     @staticmethod
-    def _parse_error_body(
-        response: httpx.Response,
-    ) -> tuple[str | None, str | None]:
-        """Extract ``(error_code, error_message)`` from a JSON error body.
+    def _parse_error_body(response: httpx.Response) -> ParsedError:
+        """Extract ``(code, message, request_id)`` from the confirmed
+        error envelope shape: ``{"error": {"code", "message",
+        "details", "request_id"}}``.
 
-        Returns ``(None, None)`` if the body is missing, not JSON, not
-        a mapping, or carries neither key. The shape is provisional:
-        either ``error`` or ``message`` is accepted for the human
-        string.
+        Tolerates a body that is absent, not valid JSON, not a JSON
+        object, or missing the ``"error"`` key. The client always
+        raises a typed error regardless; this helper just provides
+        whatever context is available.
         """
 
         try:
             data = response.json()
         except ValueError:
-            return None, None
+            return ParsedError(None, None, None)
         if not isinstance(data, dict):
-            return None, None
-        code = data.get("error_code") or data.get("code")
-        message = data.get("error") or data.get("message")
-        if code is not None and not isinstance(code, str):
-            code = None
-        if message is not None and not isinstance(message, str):
-            message = None
-        return code, message
+            return ParsedError(None, None, None)
+        err = data.get("error")
+        if not isinstance(err, dict):
+            return ParsedError(None, None, None)
+
+        code = err.get("code") if isinstance(err.get("code"), str) else None
+        message = err.get("message") if isinstance(err.get("message"), str) else None
+        request_id = (
+            err.get("request_id")
+            if isinstance(err.get("request_id"), str)
+            else None
+        )
+        return ParsedError(code, message, request_id)
+
+    @staticmethod
+    def _format_error(
+        method: str, path: str, status: int, reason: str, parsed: ParsedError
+    ) -> str:
+        """Build the human-readable error string.
+
+        Format: ``"{method} {path} -> {status} {reason}[, code={c}]
+        [, request_id={rid}][: {message}]"``. **Never** includes the
+        request body or the raw response body — only the parsed,
+        non-sensitive fields.
+        """
+
+        parts = [f"{method} {path} -> {status} {reason}".rstrip()]
+        meta: list[str] = []
+        if parsed.code:
+            meta.append(f"code={parsed.code}")
+        if parsed.request_id:
+            meta.append(f"request_id={parsed.request_id}")
+        if meta:
+            parts.append(", ".join(meta))
+        suffix = ", ".join(parts)
+        if parsed.message:
+            return f"{suffix}: {parsed.message}"
+        return suffix
 
     def _raise_for_status(
         self, response: httpx.Response, method: str, path: str
@@ -235,21 +303,32 @@ class UpstreamApiClient:
         if status < 400:
             return
 
-        error_code, parsed_msg = self._parse_error_body(response)
+        parsed = self._parse_error_body(response)
         reason = response.reason_phrase or ""
-        suffix = f": {parsed_msg}" if parsed_msg else ""
-        msg = f"{method} {path} -> {status} {reason}{suffix}".rstrip()
+        msg = self._format_error(method, path, status, reason, parsed)
 
-        if status in (401, 403):
-            if error_code == TOKEN_REVOKED_ERROR_CODE:
-                raise ApiTokenRevokedError(
-                    f"API token was rejected as revoked. {msg}"
-                )
-            raise ApiAuthError(f"API token was rejected. {msg}")
-        if status in (400, 422):
-            raise ApiValidationError(f"API rejected the request. {msg}")
+        if status == 401:
+            if parsed.code == TOKEN_REVOKED_ERROR_CODE:
+                raise ApiTokenRevokedError(msg)
+            if parsed.code == TOKEN_EXPIRED_ERROR_CODE:
+                raise ApiTokenExpiredError(msg)
+            raise ApiAuthError(msg)
+        if status == 403:
+            # 403 with a `limit_exceeded.*` code is a quota/limit
+            # rejection, which the CLI surfaces as a register/session
+            # validation error rather than an auth error.
+            if parsed.code and parsed.code.startswith("limit_exceeded."):
+                raise ApiValidationError(msg)
+            raise ApiAuthError(msg)
+        if status == 404:
+            # agent_not_found / camera_not_found / etc — treated as
+            # validation so the CLI's `Error (register_camera): ...`
+            # line reads naturally.
+            raise ApiValidationError(msg)
+        if status in (400, 409, 422):
+            raise ApiValidationError(msg)
         if status == 429:
-            raise ApiRateLimitError(f"API rate limit exceeded. {msg}")
+            raise ApiRateLimitError(msg)
         if status >= 500:
-            raise ApiServerError(f"API server error. {msg}")
+            raise ApiServerError(msg)
         raise ApiError(msg)

@@ -56,7 +56,9 @@ class CameraConfig(BaseModel):
 class StreamConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    latency_mode: Literal["low", "balanced", "quality"] = "balanced"
+    # Backend accepts: "low" (lowest latency), "balanced" (default),
+    # "stable" (steady throughput, slightly higher latency).
+    latency_mode: Literal["low", "balanced", "stable"] = "balanced"
     buffer_ms: int = Field(default=500, ge=0)
 
 
@@ -171,9 +173,12 @@ _TEMPLATE = """\
 
 api:
   # Base URL of the UpStream API server.
-  base_url: "https://api.upstream.ai"
+  # Production / staging: "https://api.upstreamcv.com"
+  # Local dev:            "http://localhost:4000"
+  base_url: "https://api.upstreamcv.com"
   # Replace with your real API token before running `upstream` commands
-  # that talk to the server.
+  # that talk to the server. Tokens look like
+  # ups_<env>_<8-char id>_<22-char secret>.
   token: "YOUR_API_TOKEN_HERE"
 
 camera:
@@ -189,7 +194,7 @@ camera:
   requested_fps: 30
 
 stream:
-  # "low" | "balanced" | "quality"
+  # "low" | "balanced" | "stable"
   latency_mode: "balanced"
   buffer_ms: 500
 

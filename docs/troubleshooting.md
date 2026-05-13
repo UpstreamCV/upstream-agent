@@ -169,19 +169,121 @@ The agent could not reach `api.base_url`. Walk these in order:
    shell and re-run. httpx respects the standard env vars.
 4. Is DNS working? `nslookup api.upstreamcv.com`.
 
-### `Error (register_agent): API token was rejected`
+### `Error (register_agent): ... code=invalid_token`
 
-The server returned `401`. Either the token in
-`~/.upstream/config.yaml` is wrong (typo, trailing newline, copied
-the placeholder by mistake) or it has been revoked. Re-paste the
-token and try again. If the error message includes "as revoked",
-generate a new token from the dashboard.
+The server returned `401` with `error.code = invalid_token`. The
+token in `~/.upstream/config.yaml` is wrong — typo, trailing
+newline, or the placeholder is still in place. Re-paste the token
+and try again. Tokens look like `ups_<env>_<8-char id>_<22-char
+secret>`.
 
-### `Error (register_agent): API token was rejected as revoked`
+### `Error (register_agent): ... code=token_revoked`
 
 The token was valid but has been revoked server-side. Generate a new
-one and rewrite `api.token` in `~/.upstream/config.yaml`. The agent
-does not (yet) auto-rotate tokens.
+one from the dashboard and rewrite `api.token` in
+`~/.upstream/config.yaml`. The agent does not (yet) auto-rotate
+tokens.
+
+### `Error (register_agent): ... code=token_expired`
+
+The token's expiry has passed. Same fix as `token_revoked`:
+generate a fresh token and edit `api.token`. The agent raises
+`ApiTokenExpiredError` for this case; it's still surfaced as an
+auth failure in the CLI.
+
+### `Error (register_camera): ... code=limit_exceeded.max_cameras`
+
+Your account has hit its camera-slot limit. The
+`details` field on the server response contains `in_use` and `max`
+counts; the CLI shows the `request_id` so you can share it with
+support. Either delete an unused camera in the dashboard or
+upgrade the plan.
+
+### `Error (register_camera): ... code=agent_not_found`
+
+Unusual — the agent registered moments earlier. Most likely the
+account_id changed or the agent was deleted server-side between
+calls. Delete `~/.upstream/agent_state.json` and re-run; the agent
+will register fresh.
+
+### `Error (register_camera): ... code=agent_account_mismatch`
+
+The `agent_id` in `~/.upstream/agent_state.json` belongs to a
+different account than the current `api.token`. This happens when
+the token is swapped without clearing local state. Delete
+`agent_state.json` and re-run, or switch back to the original
+token.
+
+### `Error (start_stream_session): ... code=camera_not_found`
+
+The `last_camera_id` in local state points at a camera the server
+no longer knows about (deleted from the dashboard, or
+account-swapped). Delete the `last_camera_id` field from
+`~/.upstream/agent_state.json` (leave `agent_id` and `device_id`
+intact) and re-run.
+
+### `Error (start_stream_session): ... code=camera_already_streaming`
+
+Another session for this camera is currently active. Wait for it
+to finish or end it from the dashboard. The agent does not yet
+attempt to take over an existing session.
+
+### `Error (start_stream_session): ... code=limit_exceeded.max_concurrent_sessions`
+
+Account-wide concurrency cap. End an existing session in the
+dashboard or upgrade the plan.
+
+### `Error (...): API response from ... did not match expected shape`
+
+The agent reached the server but the response was missing or
+malformed for a required field. With the contract now confirmed
+this should be rare; if it happens, compare the response against
+`docs/api-contracts.md` and either:
+
+- Update `upstream_agent/api/schemas.py` to match what the backend
+  actually returns, **or**
+- File an issue with the API team if the response shape regressed.
+
+The full response body is intentionally **not** included in this
+error message to avoid leaking session tokens / SRT URLs.
+
+### Where do I find the `request_id`?
+
+Every `ApiError` message now includes `request_id=<id>` when the
+server provided one. Share that string with support — it's the
+fastest way to find the matching server-side log entry.
+
+### `Warning: failed to stop stream session after check: ...`
+
+`upstream check --api` opens a stream session, confirms approval,
+and then calls `stop_stream_session` to release the camera slot.
+If that final cleanup-stop fails, the check **still exits 0** —
+registration and session approval already proved the path works —
+but you'll see this warning on stderr.
+
+What it means in practice: a session may stay active on the server
+until it expires. A second back-to-back `upstream check --api` may
+hit `camera_already_streaming` or
+`limit_exceeded.max_concurrent_sessions` until the orphan session
+clears. Two ways out:
+
+1. Wait for the server's session expiry (the `expires_at` field on
+   the start response — usually minutes-to-hours depending on plan).
+2. End the session manually from the dashboard.
+
+If you see this warning *repeatedly* on every run, the stop endpoint
+is failing for a real reason — check the `code=` and `request_id=`
+in the warning message and share them with support.
+
+### Running `upstream check --api` back-to-back
+
+With M3.3's cleanup-stop in place, running `upstream check --api`
+twice in a row should succeed both times. The first run registers
+the agent + camera, opens a session, prints "SRT URL received: yes",
+and then stops the session. The second run uses the same (idempotent)
+agent + camera and opens a fresh session. If the second run fails
+with `camera_already_streaming`, check for the stop-warning entry
+above.
 
 ### `Error (register_camera): ...`
 

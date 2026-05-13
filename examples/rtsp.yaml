@@ -7,7 +7,10 @@
 # The RTSP URL below often contains a username and password in plaintext.
 
 api:
-  base_url: "https://api.upstream.ai"
+  # Production / staging: "https://api.upstreamcv.com"
+  # Local dev:            "http://localhost:4000"
+  base_url: "https://api.upstreamcv.com"
+  # Tokens look like: ups_<env>_<8-char id>_<22-char secret>
   token: "YOUR_API_TOKEN_HERE"
 
 camera:
@@ -21,6 +24,7 @@ camera:
   requested_fps: 15
 
 stream:
+  # "low" | "balanced" | "stable"
   latency_mode: "balanced"
   buffer_ms: 750
 

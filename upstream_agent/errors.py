@@ -56,6 +56,10 @@ class ApiTokenRevokedError(ApiAuthError):
     """Raised when the server signals that the token has been revoked."""
 
 
+class ApiTokenExpiredError(ApiAuthError):
+    """Raised when the server signals that the token has expired."""
+
+
 class ApiValidationError(ApiError):
     """Raised when the server rejects a request body (400/422)."""
 

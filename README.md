@@ -85,17 +85,26 @@ See `docs/troubleshooting.md` for the full list of camera diagnostics.
 
 ### Verifying API registration
 
-`upstream check --api` walks the three-step backend flow:
+`upstream check --api` walks the backend flow:
 
 1. Register the agent (using your local `device_id` and the package
    version).
 2. Register the camera (using the fields under `camera:` in your
    config).
 3. Request a stream session and confirm the server approves it.
+4. **Stop the session** — cleanup so a back-to-back check doesn't
+   hit `camera_already_streaming`. The check is a diagnostic, not a
+   streaming launch.
 
 It stops there — no video is captured or transported. Requires a real
 API token in `~/.upstream/config.yaml`; the placeholder is rejected
 with a clear message before any HTTP request is made.
+
+Running `upstream check --api` twice in a row should succeed both
+times. If the cleanup-stop fails for some reason, you'll see a
+`Warning: failed to stop stream session…` line on stderr but the
+command still exits 0 — registration and session approval already
+proved the path works.
 
 Expected output on success:
 
@@ -104,25 +113,33 @@ API check successful
 Agent registered: agent_123
 Camera registered: cam_456
 Stream session approved: sess_789
-Approved config: h264, 1280x720 @ 30 FPS
+Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced
 SRT URL received: yes
 ```
 
 The returned `agent_id` and `camera_id` are persisted in
 `~/.upstream/agent_state.json` (partial progress is saved after each
 successful step, so a retry doesn't re-register what's already
-registered). The full SRT URL is **never** printed, logged, or
-persisted — only the boolean "received: yes" shows up.
+registered). The full SRT URL, the `streamid`, and the
+`session_token` are **never** printed, logged, or persisted — only
+the boolean "received: yes" shows up. The agent also does not send
+your real machine hostname; it identifies itself with a stable
+generated name like `upstream-agent-12345678` derived from the local
+`device_id`.
 
-On failure the command exits non-zero with a step-tagged error, e.g.:
+On failure the command exits non-zero with a step-tagged error
+that carries the server's `code` and `request_id`:
 
 ```
-Error (register_agent): API token was rejected.
+Error (register_agent): POST /v1/agents/register -> 401 Unauthorized, code=invalid_token, request_id=abc123: bad token
 ```
 
 ```
-Error (register_camera): POST /v1/cameras/register -> 422 Unprocessable Entity: name already exists.
+Error (register_camera): POST /v1/cameras/register -> 403 Forbidden, code=limit_exceeded.max_cameras, request_id=def456: Camera slot limit reached: 3 of 3.
 ```
+
+Share the `request_id` with support — it's the quickest way to find
+the matching server-side log entry.
 
 You can run both probes at once: `upstream check --camera --api`.
 
@@ -136,7 +153,8 @@ Minimal config (example values are placeholders):
 
 ```yaml
 api:
-  base_url: "https://api.upstream.ai"
+  # Production / staging
+  base_url: "https://api.upstreamcv.com"
   token: "YOUR_API_TOKEN_HERE"
 
 camera:
@@ -148,12 +166,23 @@ camera:
   requested_fps: 30
 
 stream:
+  # "low" | "balanced" | "stable"
   latency_mode: "balanced"
   buffer_ms: 500
 
 logging:
   level: "info"
 ```
+
+For local development against a dev server, swap `base_url`:
+
+```yaml
+api:
+  base_url: "http://localhost:4000"
+  token: "ups_test_YOUR_DEV_TOKEN"
+```
+
+API tokens look like `ups_<env>_<8-char id>_<22-char secret>`.
 
 See `examples/webcam.yaml` and `examples/rtsp.yaml` for fuller templates.
 
