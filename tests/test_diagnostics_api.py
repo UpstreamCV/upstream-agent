@@ -455,7 +455,15 @@ def test_agent_register_payload_uses_generated_name_no_hostname() -> None:
         session_response=_happy_session_resp(),
     )
 
-    run_api_check(_cfg(), _state(), client_factory=lambda cfg: fake)
+    # Inject capabilities so this test does not depend on the local
+    # FFmpeg install state.
+    fixed_caps: dict[str, bool | str] = {"ffmpeg": False, "srt": False}
+    run_api_check(
+        _cfg(),
+        _state(),
+        client_factory=lambda cfg: fake,
+        capabilities=fixed_caps,
+    )
 
     assert len(fake.register_agent_calls) == 1
     sent = fake.register_agent_calls[0]
@@ -469,7 +477,12 @@ def test_agent_register_payload_uses_generated_name_no_hostname() -> None:
         camera_response=_happy_camera_resp(),
         session_response=_happy_session_resp(),
     )
-    run_api_check(_cfg(), _state(), client_factory=lambda cfg: fake2)
+    run_api_check(
+        _cfg(),
+        _state(),
+        client_factory=lambda cfg: fake2,
+        capabilities=fixed_caps,
+    )
     assert fake2.register_agent_calls[0].name == sent.name
 
     # Hostname must not be set.
@@ -479,8 +492,37 @@ def test_agent_register_payload_uses_generated_name_no_hostname() -> None:
     assert sent.os == sent.os.lower()
     assert sent.os != ""
 
-    # Capabilities are the honest static map.
-    assert sent.capabilities == {"ffmpeg": False, "srt": False}
+    # Capabilities mirror the injected dict — this proves the kwarg
+    # actually wires through to the request payload.
+    assert sent.capabilities == fixed_caps
+
+
+def test_agent_register_capabilities_default_to_probed_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no capabilities kwarg is given, the FFmpeg probe drives the payload."""
+
+    from upstream_agent.diagnostics import api as api_module
+    from upstream_agent.diagnostics.ffmpeg_check import FfmpegProbeResult
+
+    stub = FfmpegProbeResult(
+        available=True,
+        version="9.9.9",
+        srt_supported=True,
+        h264_encoder="libx264",
+        error=None,
+    )
+    monkeypatch.setattr(api_module, "probe_ffmpeg", lambda: stub)
+
+    fake = FakeUpstreamApiClient(
+        agent_response=_happy_agent_resp(),
+        camera_response=_happy_camera_resp(),
+        session_response=_happy_session_resp(),
+    )
+    run_api_check(_cfg(), _state(), client_factory=lambda cfg: fake)
+
+    sent = fake.register_agent_calls[0]
+    assert sent.capabilities == {"ffmpeg": "9.9.9", "srt": True}
 
 
 def test_camera_register_payload_uses_stable_external_id_and_device_path() -> None:

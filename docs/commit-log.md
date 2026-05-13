@@ -32,6 +32,62 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-13 - feat: FFmpeg/SRT streaming preflight (Milestone 4)
+
+### Summary
+Milestone 4 adds `upstream check --streaming`, a local preflight that answers "is this machine ready to stream?" without actually streaming. It probes the local FFmpeg install (version, SRT protocol support, H264 encoder), reuses the existing M3 API approval flow to obtain an approved SRT URL, validates that URL, builds the FFmpeg command Milestone 5 will execute, then stops the temporary session. No frames are pushed, no long-running subprocess is started.
+
+The same milestone makes the `capabilities` payload the agent sends to `register_agent` honest. Pre-M4 it was always `{"ffmpeg": false, "srt": false}`. Post-M4, both `--api` and `--streaming` probe FFmpeg once and report `{"ffmpeg": "<version>", "srt": <bool>}` based on what the local binary actually supports.
+
+### Files touched
+- `upstream_agent/errors.py` - added `FfmpegError` family (`FfmpegNotFoundError`, `FfmpegProbeError`, `FfmpegSrtUnsupportedError`, `FfmpegH264UnsupportedError`), `SrtUrlError`, `CommandBuildError`. All inherit from `UpstreamError` so the top-level CLI catch keeps working.
+- `upstream_agent/diagnostics/ffmpeg_check.py` (new) - `FfmpegProbeResult` dataclass and `probe_ffmpeg(*, timeout_seconds=5.0, runner=None)`. Runs `ffmpeg -version` / `-protocols` / `-encoders` via one safe subprocess helper. Detects SRT with a line-boundary regex (no false match on `srtp`). Picks an H264 encoder by priority: libx264 → h264_videotoolbox → h264_nvenc → h264_qsv → h264_amf. Never raises. The `runner` kwarg lets tests stub subprocess entirely.
+- `upstream_agent/transport/__init__.py` (new), `upstream_agent/transport/srt.py` (new) - `ParsedSrtUrl` dataclass and `parse_srt_url(url)`. Validates scheme (`srt`), host, and port; raises `SrtUrlError` otherwise. Returns only safe metadata (booleans, port, mode, latency). The raw URL, hostname, and streamid never reach the dataclass.
+- `upstream_agent/encoder/__init__.py` (new), `upstream_agent/encoder/command_builder.py` (new) - `build_ffmpeg_command(...)` returns a `list[str]` ready for Milestone 5 to execute. `redact_command(cmd, srt_url)` returns a fresh list with the SRT URL replaced by `srt://<redacted>`, never mutating the input. Input handling is provisional (`-f rawvideo -pix_fmt bgr24 ... -i pipe:0`) — M5 will finalise it.
+- `upstream_agent/diagnostics/api.py` - removed the static `_AGENT_CAPABILITIES = {"ffmpeg": False, "srt": False}` constant. Added `_default_capabilities()` which probes FFmpeg lazily. Extracted `_obtain_stream_approval(cfg, state, client, capabilities, save_progress)` private helper (steps 1–3) reused by both `run_api_check` and the new streaming orchestrator. `run_api_check` now accepts an optional `capabilities` kwarg; defaults to the probed value. Public signature is backwards-compatible.
+- `upstream_agent/diagnostics/streaming.py` (new) - `StreamingCheckResult` dataclass and `run_streaming_check(cfg, state, *, client_factory=None, save_progress=None, ffmpeg_probe=None)`. Eight phases (FFmpeg → SRT support → H264 encoder → register agent → register camera → start session → SRT URL parse → command build) plus a best-effort cleanup stop. The raw SRT URL lives in a single local variable inside the function and is dropped before returning — only safe booleans cross out.
+- `upstream_agent/cli.py` - added `--streaming` flag to `check`, `_print_streaming_check_success` helper, and wiring after the `--api` block. Updated the placeholder-token gate to fire on `api OR streaming`. Updated the "no flag" hint to mention `--streaming`.
+- `tests/test_diagnostics_ffmpeg.py` (new) - 12 tests against an injected `runner`. Real `ffmpeg` is never invoked.
+- `tests/test_transport_srt.py` (new) - 14 tests. Uses placeholder URLs only; asserts `repr()` does not leak streamid or hostname.
+- `tests/test_encoder_command_builder.py` (new) - 13 tests covering shape, encoder choice, redaction, edge cases.
+- `tests/test_diagnostics_streaming.py` (new) - 14 tests against a fake API client and injected FFmpeg probe. Covers happy path, three local-failure phases (no API call fires), three API-failure phases (correct stop-or-not behaviour), SRT URL failures, command-build failure, stop-warning best-effort, leak guards on both the result and `caplog`, and capability-payload reporting from the probe.
+- `tests/test_diagnostics_api.py` - updated the capabilities test to inject a fixed dict (deterministic, no real FFmpeg dependency) and added a new test that the default capabilities come from a probed value when no kwarg is given.
+- `tests/test_cli.py` - added 9 tests for `--streaming` (no config, placeholder token, happy path, FFmpeg missing, SRT unsupported, no H264, API failure, leak guard, capabilities flow), plus a `--camera --api --streaming` ordering test.
+- `README.md` - new "Verifying streaming readiness" section with success/error examples and FFmpeg install hints for macOS / Linux / Windows. Updated the status section: M3 → done, M4 → current, M5 → live streaming.
+- `docs/architecture.md` - status table refreshed (M4 done; live streaming and frame buffer deferred to M5). New "Local preflight layer (Milestone 4)" subsection documenting the three new modules and the capabilities-reporting change.
+- `docs/module-map.md` - documented `diagnostics/ffmpeg_check.py`, `diagnostics/streaming.py`, `encoder/`, `transport/`. Updated the `diagnostics/api.py` row for the new `capabilities` kwarg and `_obtain_stream_approval` helper. Updated `errors.py` to list the new exception classes. Trimmed the "deferred submodules" table to what's still unimplemented (M5 wiring of `encoder/ffmpeg.py` and the live SRT transport).
+- `docs/api-contracts.md` - added an M4 note up top: no new endpoints; only the `capabilities` payload on `register_agent` changed. Updated the `register_agent` example payload to show `{"ffmpeg": "8.1.1", "srt": true}`.
+- `docs/troubleshooting.md` - new section with entries for FFmpeg not found, no SRT support, no H264 encoder, API failure during streaming check, invalid SRT URL, command build failure, stop warning, and the "passes but cannot stream yet" expectation.
+
+### Functions/classes changed
+- `FfmpegProbeResult` / `probe_ffmpeg()` (new) - structured outcome of the local probe; safe to log, no environment leak.
+- `ParsedSrtUrl` / `parse_srt_url()` (new) - validate and extract safe display metadata from an SRT URL.
+- `build_ffmpeg_command()` / `redact_command()` (new) - argv builder + display redactor; H264-only for M4.
+- `StreamingCheckResult` / `run_streaming_check()` (new) - eight-phase orchestrator; never raises.
+- `_default_capabilities()` (new) - lazy FFmpeg probe driving the `register_agent` capabilities payload.
+- `_obtain_stream_approval()` (new private helper) - extracted from `run_api_check`; now shared by both orchestrators. Carries the raw `StreamSessionResponse` so callers can use the SRT URL locally; callers are responsible for the cleanup stop and for dropping the response.
+- `run_api_check()` - gained an optional `capabilities` kwarg. Internal flow simplified by delegating steps 1–3 to the shared helper.
+- `check_cmd` (CLI) - gained the `--streaming` flag, the placeholder gate now covers both `api` and `streaming`.
+
+### System interaction notes
+The agent now probes FFmpeg before any API call when an API check is requested. The probe adds ~50 ms in the warm-cache case, runs three short subprocess calls, never opens a window, and reports honest capabilities to the backend. The streaming check creates and stops its own temporary session — separate from any session `--api` might have created. Running `upstream check --camera --api --streaming` will create and stop two temporary sessions back-to-back.
+
+Local state (`agent_state.json`) is unchanged: still only `agent_id`, `device_id`, `last_camera_id`. Session info, SRT URLs, and session tokens are never persisted.
+
+### Testing/checks
+- `pytest -q` passes (219 tests; 155 from M3.3 + 64 new across the four M4 test files and two updated M3 tests).
+- `ruff check upstream_agent tests` — same 4 pre-existing warnings (3 B008 typer Option defaults + 1 I001 in `tests/test_token_redaction.py`); no new lint categories.
+- Real `upstream check --streaming` smoke against the live backend, run **twice**:
+  - First run on a default Homebrew `ffmpeg` build (no libsrt): the check fails at the `srt_support` phase with the expected install hint. Useful proof that the failure path renders correctly.
+  - Second run on Homebrew `ffmpeg-full` (libsrt enabled): the check passes all eight phases — FFmpeg detected, SRT supported, libx264 picked, API approval received, SRT URL parsed, command built. The temporary session is stopped before exit. Output is the spec example block verbatim with no tokens, SRT URLs, stream IDs, or session tokens.
+
+### Follow-up TODOs
+- macOS users: document the `brew install ffmpeg-full` requirement in `README.md` and `docs/troubleshooting.md` (done — added an SRT-support entry pointing operators at `ffmpeg-full`).
+- M5 will wire the actual FFmpeg subprocess: take the `list[str]` from `build_ffmpeg_command`, launch it with a managed `subprocess.Popen`, pipe BGR frames in from `WebcamSource`, monitor exit codes, and reconnect on transient failure.
+- Once M5 lands, `encoder/__init__.py` will gain `FfmpegStreamer` (or similar) and the provisional `pipe:0` input flow may be revisited if a different source-to-FFmpeg path proves better.
+
+---
+
 ## 2026-05-12 - feat: cleanup stop session after upstream check --api (Milestone 3.3)
 
 ### Summary

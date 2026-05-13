@@ -33,32 +33,39 @@ to the UpStream streaming server.
            heartbeat (status, errors, metrics) ──▶ UpStream API
 ```
 
-## What exists today (Milestones 1, 2, and 3)
+## What exists today (Milestones 1–4)
 
-The foundation, a local camera probe, and a three-step API
-registration probe. Milestone 1 delivered the CLI, config loader,
-local state, and logging with token redaction. Milestone 2 added the
-camera-source layer and `upstream check --camera`. Milestone 3 added
-the HTTP client foundation (`upstream_agent/api/`) and
-`upstream check --api`, which proves the backend approves this agent
-+ camera for streaming — stopping short of any actual video transport.
+The foundation, a local camera probe, a three-step API registration
+probe, and a local streaming preflight. Milestone 1 delivered the
+CLI, config loader, local state, and logging with token redaction.
+Milestone 2 added the camera-source layer and
+`upstream check --camera`. Milestone 3 added the HTTP client
+foundation (`upstream_agent/api/`) and `upstream check --api`, which
+proves the backend approves this agent + camera for streaming.
+Milestone 4 adds the local FFmpeg/SRT/H264 preflight, the SRT URL
+parser, the FFmpeg command builder, and `upstream check --streaming`
+— still stopping short of any actual video transport.
 
-Nothing yet encodes video or streams.
+Nothing yet encodes video or streams over SRT — but the agent can
+now verify *every* piece needed to do so.
 
 | Layer | Status |
 | --- | --- |
-| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api`, `--version`) | done |
+| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api` / `--streaming`, `--version`) | done |
 | Config loader (YAML + Pydantic validation) | done |
 | Local state (`agent_state.json` with stable `device_id`, `agent_id`, `last_camera_id`) | done |
 | Logging (rotating file + stderr, token redaction) | done |
 | Camera sources (`VideoSource` ABC + `WebcamSource`) | partial (webcam only) |
-| API client (register-agent / register-camera / start-stream-session) | M3 contract confirmed; mocked tests green; real smoke pending |
-| Diagnostics (`upstream check --camera`, `--api`) | partial (camera + API only) |
+| API client (register-agent / register-camera / start/stop-stream-session) | M3 contract confirmed; mocked tests green |
+| Diagnostics (camera, API, streaming preflight) | done for M4 scope |
+| FFmpeg probe (version / SRT protocol / H264 encoder) | done |
+| SRT URL parsing/validation | done |
+| FFmpeg command builder | done (provisional input — finalised in M5) |
+| Honest agent capabilities reporting via `register_agent` | done |
+| Live SRT streaming (FFmpeg subprocess + frame piping) | **M5** |
+| Frame buffer | **planned** |
 | Token rotation, config fetch, heartbeat, event endpoints | **planned** |
 | RTSP / IP camera / file sources | **planned** |
-| Frame buffer | **planned** |
-| FFmpeg encoder | **planned** |
-| SRT transport | **planned** |
 | Supervisor (orchestrates the running agent) | **planned** |
 
 ## Camera source layer
@@ -155,6 +162,56 @@ later failure does not lose earlier IDs.
 The check stops *before* any streaming. Future milestones will read
 the SRT URL from a fresh `start_stream_session` call when they
 actually need to connect to the streaming server.
+
+## Local preflight layer (Milestone 4)
+
+`upstream check --streaming` answers a single question — *is this
+machine ready to stream?* — without actually streaming. The phases
+chain together like this:
+
+```
+Config ── FFmpeg probe ── API approval ── SRT URL parse ── command build
+                │             │              │                 │
+            version,      approved      validate scheme,    list[str] —
+            srt support,  config +      host, port, mode   construction
+            H264 encoder  SRT URL                          only; not run
+```
+
+The orchestrator is :func:`upstream_agent.diagnostics.streaming.run_streaming_check`.
+It composes three independent modules:
+
+- :mod:`upstream_agent.diagnostics.ffmpeg_check` —
+  :func:`probe_ffmpeg` runs ``ffmpeg -version`` / ``-protocols`` /
+  ``-encoders`` via a safe ``subprocess.run`` (no shell, timeouts,
+  captured stdout/stderr) and returns a :class:`FfmpegProbeResult`
+  describing what the local binary supports.
+- :mod:`upstream_agent.transport.srt` — :func:`parse_srt_url`
+  validates the approved SRT URL and returns a :class:`ParsedSrtUrl`
+  with only safe-to-display metadata (booleans, the port, the mode,
+  and the latency). The raw URL, host, and streamid are never stored
+  on the result.
+- :mod:`upstream_agent.encoder.command_builder` —
+  :func:`build_ffmpeg_command` returns the ``list[str]`` argv that
+  Milestone 5 will execute. The list is constructed only to prove it
+  builds; M4 discards it immediately. :func:`redact_command` exists
+  for any future need to display the command — it replaces the SRT
+  URL with the literal ``srt://<redacted>``.
+
+The API approval phase shares logic with `upstream check --api` via
+the private :func:`_obtain_stream_approval` helper in
+:mod:`upstream_agent.diagnostics.api`. Both orchestrators build the
+same `register_agent` / `register_camera` / `start_stream_session`
+payloads and both stop the session before returning. The shared
+helper also receives a `capabilities` dict so the streaming check
+can pass its FFmpeg probe results straight into `register_agent` —
+making the backend's view of "what can this agent do" honest.
+
+**Capabilities reporting.** Before Milestone 4 the agent always sent
+`{"ffmpeg": false, "srt": false}` to `register_agent`. After
+Milestone 4, both `--api` and `--streaming` probe FFmpeg once and
+send `{"ffmpeg": "<version>", "srt": <bool>}` based on what the
+local binary actually supports. The probe is fast (~50 ms) and runs
+only when the check needs to call the API.
 
 ## Design principles
 

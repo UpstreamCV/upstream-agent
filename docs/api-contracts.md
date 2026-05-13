@@ -9,6 +9,14 @@ reflect what the API team has settled on.
 > will land in the same two files (`upstream_agent/api/client.py` for
 > paths, `upstream_agent/api/schemas.py` for shapes); the rest of
 > the agent does not need to change.
+>
+> **Milestone 4 update:** no new endpoints. The streaming preflight
+> reuses the existing `register_agent` / `register_camera` /
+> `start_stream_session` / `stop_stream_session` flow. The only
+> wire change is the `capabilities` payload on `register_agent`,
+> which now reports honest probed values (`{"ffmpeg":
+> "<version>", "srt": <bool>}`) instead of the hardcoded
+> `{"ffmpeg": false, "srt": false}`.
 
 ## Base URLs
 
@@ -77,8 +85,8 @@ and stable across runs.
   "os": "darwin",
   "python_version": "3.12.13",
   "capabilities": {
-    "ffmpeg": false,
-    "srt": false
+    "ffmpeg": "8.1.1",
+    "srt": true
   }
 }
 ```
@@ -90,7 +98,7 @@ and stable across runs.
 | `version` | yes | `upstream_agent.__version__`. |
 | `os` | yes | `platform.system().lower()` — `"darwin"`, `"linux"`, `"windows"`. |
 | `python_version` | yes | `platform.python_version()` — e.g. `"3.12.13"`. |
-| `capabilities` | yes | Honest static `{"ffmpeg": false, "srt": false}` until those features land in M4+. |
+| `capabilities` | yes | Honest probed values from M4 onward: `{"ffmpeg": "<version>"\|false, "srt": <bool>}`. `ffmpeg` is the version string when FFmpeg is detected, else `false`; `srt` is `true` only if `ffmpeg -protocols` lists the `srt` protocol. |
 
 **Response 200**
 
@@ -103,7 +111,7 @@ and stable across runs.
     "version": "0.1.0",
     "os": "darwin",
     "python_version": "3.12.13",
-    "capabilities": { "ffmpeg": false, "srt": false },
+    "capabilities": { "ffmpeg": "8.1.1", "srt": true },
     "status": "active",
     "last_seen_at": "2026-05-13T02:00:00Z",
     "created_at": "2026-05-12T20:00:00Z",

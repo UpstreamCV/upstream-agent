@@ -336,6 +336,89 @@ near-misses we already test for: error messages from the API client,
 log records emitted by httpx when debug logging is on, and config
 display in `upstream status`.
 
+## Streaming preflight (`upstream check --streaming`)
+
+### `Error (ffmpeg): FFmpeg is not installed or not on PATH.`
+
+The agent looks for `ffmpeg` on `PATH`. Install it (the agent does
+not install it for you):
+
+- **macOS**: `brew install ffmpeg` (verify that the build includes
+  `libsrt` and `libx264` — see the next entry).
+- **Linux**: `apt install ffmpeg` (Debian/Ubuntu) or your distro's
+  equivalent. SRT support depends on how the distro built the
+  package.
+- **Windows**: a static FFmpeg build from a trusted source. Make
+  sure `ffmpeg.exe` is on `PATH`.
+
+Verify by running `ffmpeg -version` in the same shell where you'll
+run `upstream`.
+
+### `Error (srt_support): FFmpeg is installed, but this build does not support SRT.`
+
+Your `ffmpeg` binary was compiled without `libsrt`. The agent can
+detect this — `ffmpeg -protocols | grep -w srt` returns nothing
+(only `srtp`, which is unrelated). Reinstall with libsrt enabled:
+
+- **macOS (Homebrew)**: the default `brew install ffmpeg` formula
+  does **not** ship with libsrt on most bottles. Install the
+  `ffmpeg-full` formula instead:
+
+  ```bash
+  brew uninstall ffmpeg
+  brew install ffmpeg-full
+  ```
+
+  After reinstall, confirm with `ffmpeg -protocols | grep -w srt` —
+  you should see a bare `srt` line (not just `srtp`). Then re-run
+  `upstream check --streaming`.
+- **Linux**: install the version that includes `libsrt`, or compile
+  from source with `--enable-libsrt`.
+- **Windows**: pick a static build advertised as including libsrt.
+
+### `Error (h264_encoder): FFmpeg is installed but no usable H264 encoder is available.`
+
+The build does not include `libx264` and no platform H264 encoder
+(`h264_videotoolbox` on macOS, `h264_nvenc` on NVIDIA, etc.) is
+available either. Install an FFmpeg build with libx264.
+
+### `Error (start_stream_session): ...` during `--streaming`
+
+The local FFmpeg/SRT/H264 phases passed but the API rejected the
+session-start. This is the same error you'd see from
+`upstream check --api`; the troubleshooting under "API" applies.
+
+### `Error (srt_url_parse): Approved SRT URL is invalid: ...`
+
+The server returned an SRT URL that fails parsing (wrong scheme,
+missing host, missing port). The agent does **not** echo the URL in
+the error message. If this fires, the backend probably regressed —
+share the `request_id` from the matching API error (if any) with the
+backend team. The agent still stops the temporary session before
+exiting, so the camera slot is released.
+
+### `Error (command_build): ...`
+
+The approved config the server returned is something the M4 command
+builder cannot encode (e.g. a codec other than H264). The most
+common cause is a server-side update that returned a new codec
+without bumping the client. The agent stops the temporary session
+before exiting.
+
+### `Warning: failed to stop stream session after check`
+
+Mirrors the same warning under `--api`. The check itself succeeded;
+the server-side session will expire on its own. If this fires
+consistently, look at the server logs for the `stop_stream_session`
+endpoint.
+
+### Streaming check passes but `upstream` cannot actually stream yet
+
+That is expected as of Milestone 4. `upstream check --streaming`
+verifies every prerequisite for streaming but does not start a
+long-running FFmpeg process or push any frames. Live streaming
+lands in Milestone 5.
+
 ## Installation
 
 ### `pip install -e .` fails on Python 3.9 or older

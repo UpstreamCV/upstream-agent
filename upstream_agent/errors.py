@@ -74,3 +74,31 @@ class ApiServerError(ApiError):
 
 class ApiContractError(ApiError):
     """Raised when an API response is missing required fields or is not valid JSON."""
+
+
+class FfmpegError(UpstreamError):
+    """Base class for FFmpeg-related failures."""
+
+
+class FfmpegNotFoundError(FfmpegError):
+    """Raised when the ffmpeg binary is not installed or not on PATH."""
+
+
+class FfmpegProbeError(FfmpegError):
+    """Raised when ffmpeg is present but a probe subprocess fails."""
+
+
+class FfmpegSrtUnsupportedError(FfmpegError):
+    """Raised when the installed ffmpeg build does not support the SRT protocol."""
+
+
+class FfmpegH264UnsupportedError(FfmpegError):
+    """Raised when no usable H264 encoder is available in this ffmpeg build."""
+
+
+class SrtUrlError(UpstreamError):
+    """Raised when an SRT URL is missing required parts or has the wrong scheme."""
+
+
+class CommandBuildError(UpstreamError):
+    """Raised when the FFmpeg command line cannot be built from approved config."""

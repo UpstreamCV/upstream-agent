@@ -7,9 +7,11 @@ and streams video securely to the UpStream streaming server.
 This README reflects the **current shape** of the project. The agent is
 under active development. Today it can be configured locally, probe
 a webcam (open, read one frame, report resolution and FPS, release),
-and probe the API (register the agent, register the camera, request
-a stream session) without actually streaming. Encoding and SRT
-transport land in later milestones.
+probe the API (register the agent, register the camera, request
+a stream session), and run a streaming preflight (verify FFmpeg, SRT
+support, H264, build the FFmpeg command Milestone 5 will execute) —
+all without actually streaming. Encoding and SRT transport land in
+Milestone 5.
 
 ## Requirements
 
@@ -48,6 +50,9 @@ upstream check --camera
 
 # 5. Verify the API accepts this agent + camera and approves a stream.
 upstream check --api
+
+# 6. Verify this machine is ready to stream (FFmpeg, SRT, H264, command build).
+upstream check --streaming
 ```
 
 ### Verifying camera access
@@ -141,7 +146,84 @@ Error (register_camera): POST /v1/cameras/register -> 403 Forbidden, code=limit_
 Share the `request_id` with support — it's the quickest way to find
 the matching server-side log entry.
 
-You can run both probes at once: `upstream check --camera --api`.
+You can run any combination of probes in one invocation:
+`upstream check --camera --api --streaming`. They run in that fixed
+order; each is independent.
+
+### Verifying streaming readiness
+
+`upstream check --streaming` is the local preflight for actually
+streaming. It checks:
+
+1. **FFmpeg** is installed and on `PATH`, reports its version.
+2. The installed FFmpeg build **supports the SRT protocol** (`ffmpeg
+   -protocols` lists `srt`, not just `srtp`).
+3. FFmpeg has a usable **H264 encoder** — `libx264`,
+   `h264_videotoolbox`, or another platform encoder.
+4. The API approves a stream session and returns an SRT URL
+   (re-uses the `upstream check --api` flow, then **stops** the
+   session so the check is repeatable).
+5. The SRT URL is syntactically valid (scheme, host, port).
+6. The FFmpeg command that Milestone 5 will execute **builds**
+   from the approved config without error.
+
+It does **not** stream video. Milestone 5 will wire the actual
+FFmpeg subprocess and SRT transport.
+
+Expected output on success:
+
+```
+Streaming preflight successful
+FFmpeg: found, version 8.1.1
+SRT support: yes
+H264 encoder: yes (libx264)
+API stream approval: yes
+Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced
+SRT URL received: yes
+FFmpeg command build: yes
+```
+
+The full SRT URL, the `streamid`, the `session_token`, and the API
+token are **never** printed or logged. Only the booleans appear.
+
+#### Installing FFmpeg
+
+The agent does not install FFmpeg automatically. Make sure your build
+has both **libsrt** (for SRT transport) and **libx264** (or a
+platform H264 encoder).
+
+* **macOS** (Homebrew):
+
+  ```bash
+  brew install ffmpeg
+  ```
+
+  Note: not every Homebrew FFmpeg bottle ships with `libsrt`. If
+  `upstream check --streaming` reports `srt_support` as missing,
+  rebuild with `brew install ffmpeg --with-srt` or pull a static
+  build that bundles libsrt.
+
+* **Linux**: install through your package manager (e.g.
+  `apt install ffmpeg`). SRT support depends on how your distro
+  built the package; verify with `ffmpeg -protocols | grep -w srt`.
+
+* **Windows**: install a binary build that includes libsrt and
+  libx264 (the [official static builds](https://ffmpeg.org/download.html)
+  are one option). Make sure `ffmpeg.exe` is on `PATH`.
+
+On failure the command exits non-zero with a step-tagged error.
+The most common ones:
+
+```
+Error (ffmpeg): FFmpeg is not installed or not on PATH.
+Error (srt_support): FFmpeg is installed, but this build does not support SRT. Install an FFmpeg build with libsrt enabled.
+Error (h264_encoder): FFmpeg is installed but no usable H264 encoder is available.
+```
+
+The agent also updates the `capabilities` it reports to the backend
+on `register_agent`: ``{"ffmpeg": "<version>", "srt": <bool>}`` based
+on the local probe. This applies to both `--api` and `--streaming`
+runs.
 
 ## Configuration
 
@@ -210,12 +292,14 @@ The agent stores everything under `~/.upstream/`:
   token redaction, tests, docs.
 - **Milestone 2: camera check.** `VideoSource` ABC, `WebcamSource`,
   `upstream check --camera`.
-- **Milestone 3 (current): API registration.** `UpstreamApiClient`,
+- **Milestone 3: API registration.** `UpstreamApiClient`,
   three POST endpoints (register agent / register camera / start
   stream session), `upstream check --api`.
-- Milestone 4+: frame buffer, FFmpeg encoder, SRT transport,
-  heartbeat, token rotation, supervisor, additional source types and
-  diagnostics.
+- **Milestone 4 (current): streaming preflight.** FFmpeg probe, SRT
+  URL parser, FFmpeg command builder, `upstream check --streaming`.
+  No live streaming yet.
+- Milestone 5+: live SRT streaming, frame buffer, heartbeat, token
+  rotation, supervisor, additional source types and diagnostics.
 
 See `docs/architecture.md` for the planned end-to-end flow.
 

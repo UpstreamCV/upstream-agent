@@ -753,3 +753,250 @@ def test_check_api_back_to_back_runs_both_succeed(
 
     # Stop was called once per run.
     assert captures["stop_calls"] == ["sess_789", "sess_789"]
+
+
+# ---------------------------------------------------------------------------
+# upstream check --streaming
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_ffmpeg_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    available: bool = True,
+    version: str | None = "9.0.0",
+    srt_supported: bool = True,
+    h264_encoder: str | None = "libx264",
+    error: str | None = None,
+) -> None:
+    """Stub the FFmpeg probe used by both diagnostic modules."""
+
+    from upstream_agent.diagnostics import api as api_module
+    from upstream_agent.diagnostics import streaming as streaming_module
+    from upstream_agent.diagnostics.ffmpeg_check import FfmpegProbeResult
+
+    result = FfmpegProbeResult(
+        available=available,
+        version=version,
+        srt_supported=srt_supported,
+        h264_encoder=h264_encoder,
+        error=error,
+    )
+
+    monkeypatch.setattr(streaming_module, "probe_ffmpeg", lambda: result)
+    monkeypatch.setattr(api_module, "probe_ffmpeg", lambda: result)
+
+
+def test_check_streaming_no_config_exits_with_init_hint(home_dir: Path) -> None:
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 1
+    assert "No config found" in result.stderr
+    assert "upstream init" in result.stderr
+
+
+def test_check_streaming_placeholder_token_exits_one(home_dir: Path) -> None:
+    _write_camera_config(home_dir, token=PLACEHOLDER_TOKEN)
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 1
+    assert "API token is still a placeholder" in result.stderr
+
+
+def test_check_streaming_happy_path_prints_expected_block(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_ffmpeg_probe(monkeypatch)
+    _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Streaming preflight successful" in result.stdout
+    assert "FFmpeg: found, version 9.0.0" in result.stdout
+    assert "SRT support: yes" in result.stdout
+    assert "H264 encoder: yes (libx264)" in result.stdout
+    assert "API stream approval: yes" in result.stdout
+    assert (
+        "Approved config: h264, 1280x720 @ 30 FPS, 3000 kbps, balanced"
+        in result.stdout
+    )
+    assert "SRT URL received: yes" in result.stdout
+    assert "FFmpeg command build: yes" in result.stdout
+
+
+def test_check_streaming_ffmpeg_missing_fails_with_install_hint(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_ffmpeg_probe(
+        monkeypatch,
+        available=False,
+        version=None,
+        srt_supported=False,
+        h264_encoder=None,
+        error="FFmpeg is not installed or not on PATH.",
+    )
+    captures = _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 1
+    assert "Error (ffmpeg):" in result.stderr
+    assert "FFmpeg" in result.stderr
+    # API was never called.
+    assert captures["agent_calls"] == 0
+
+
+def test_check_streaming_srt_unsupported_fails_with_libsrt_hint(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_ffmpeg_probe(
+        monkeypatch,
+        available=True, version="8.1.1",
+        srt_supported=False, h264_encoder="libx264",
+    )
+    captures = _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 1
+    assert "Error (srt_support):" in result.stderr
+    assert "libsrt" in result.stderr
+    assert captures["agent_calls"] == 0
+
+
+def test_check_streaming_no_h264_encoder_fails_clearly(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_ffmpeg_probe(
+        monkeypatch,
+        available=True, version="8.1.1",
+        srt_supported=True, h264_encoder=None,
+    )
+    captures = _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 1
+    assert "Error (h264_encoder):" in result.stderr
+    assert "H264" in result.stderr
+    assert captures["agent_calls"] == 0
+
+
+def test_check_streaming_api_failure_exits_one(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from upstream_agent.errors import ApiAuthError
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_ffmpeg_probe(monkeypatch)
+    _install_fake_api_client(
+        monkeypatch, agent_raises=ApiAuthError("token rejected"),
+    )
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 1
+    assert "Error (register_agent):" in result.stderr
+
+
+def test_check_streaming_does_not_leak_token_srt_url_streamid_session_token(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_token = "ups_live_streaming_must_not_leak"
+    _write_camera_config(home_dir, token=secret_token)
+    _install_fake_ffmpeg_probe(monkeypatch)
+    _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 0
+    for blob in (result.stdout, result.stderr):
+        assert secret_token not in blob
+        assert _API_SECRET_SRT_URL not in blob
+        assert _API_SECRET_SESSION_TOKEN not in blob
+        assert "publish:secret" not in blob
+
+    log_file = home_dir / ".upstream" / "logs" / "agent.log"
+    if log_file.exists():
+        content = log_file.read_text(encoding="utf-8")
+        assert secret_token not in content
+        assert _API_SECRET_SRT_URL not in content
+        assert _API_SECRET_SESSION_TOKEN not in content
+        assert "publish:secret" not in content
+
+
+def test_check_streaming_capabilities_payload_reflects_ffmpeg_probe(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """register_agent should be called with capabilities derived from the probe."""
+
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    _install_fake_ffmpeg_probe(
+        monkeypatch, version="9.0.0", srt_supported=True,
+    )
+
+    sent_requests: list = []
+
+    from upstream_agent.api.schemas import (
+        Agent,
+        AgentRegisterResponse,
+        ApprovedStreamConfig,
+        Camera,
+        CameraRegisterResponse,
+        RequestedStreamConfig,
+        Session,
+        StopStreamSessionResponse,
+        StreamSessionResponse,
+    )
+    from upstream_agent.diagnostics import api as api_module
+
+    class FakeClient:
+        def __enter__(self) -> FakeClient:
+            return self
+        def __exit__(self, *_: object) -> None:
+            return None
+        def register_agent(self, req):
+            sent_requests.append(req)
+            return AgentRegisterResponse(agent=Agent(id="agent_x", status="active"))
+        def register_camera(self, req):
+            return CameraRegisterResponse(
+                camera=Camera(id="cam_x", external_id="webcam-0", status="active")
+            )
+        def start_stream_session(self, req):
+            approved = dict(width=1280, height=720, fps=30, codec="h264",
+                            bitrate_kbps=3000, latency_mode="balanced")
+            return StreamSessionResponse(
+                session=Session(
+                    id="sess_x", state="approved",
+                    srt_url="srt://ingest.test.local:8890/?streamid=PLACEHOLDER",
+                    requested=RequestedStreamConfig(**approved),
+                    approved=ApprovedStreamConfig(**approved),
+                ),
+                srt_url="srt://ingest.test.local:8890/?streamid=PLACEHOLDER",
+            )
+        def stop_stream_session(self, session_id):
+            return StopStreamSessionResponse()
+
+    monkeypatch.setattr(api_module, "_default_factory", lambda cfg: FakeClient())
+
+    result = runner.invoke(app, ["check", "--streaming"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(sent_requests) == 1
+    assert sent_requests[0].capabilities == {"ffmpeg": "9.0.0", "srt": True}
+
+
+def test_check_camera_api_streaming_runs_all_three_in_order(
+    home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_camera_config(home_dir, token="real_token_value_xyz")
+    monkeypatch.setitem(sys.modules, "cv2", _build_fake_cv2(opens=True))
+    _install_fake_ffmpeg_probe(monkeypatch)
+    _install_fake_api_client(monkeypatch)
+
+    result = runner.invoke(app, ["check", "--camera", "--api", "--streaming"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Camera opened successfully" in result.stdout
+    assert "API check successful" in result.stdout
+    assert "Streaming preflight successful" in result.stdout
+
+    cam_idx = result.stdout.index("Camera opened successfully")
+    api_idx = result.stdout.index("API check successful")
+    stream_idx = result.stdout.index("Streaming preflight successful")
+    assert cam_idx < api_idx < stream_idx
