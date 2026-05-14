@@ -32,6 +32,22 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-14 - docs: refresh srt_url example to current ingest host and streamid
+
+### Summary
+`docs/api-contracts.md` still showed `srt://ingest.upstream.tv:8890?streamid=publish:...` — a stale placeholder hostname and the pre-fix JWT-bearing streamid shape. Updated both example responses to match what the live API returns today: `srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200`. Doc-only; no code change.
+
+### Files touched
+- docs/api-contracts.md — two `srt_url` strings and the `streamid` example value.
+
+### Testing/checks
+- Doc-only; nothing exercises the changed strings at runtime.
+
+### Follow-up TODOs
+- None.
+
+---
+
 ## 2026-05-12 - feat: cleanup stop session after upstream check --api (Milestone 3.3)
 
 ### Summary

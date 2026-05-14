@@ -210,15 +210,15 @@ Requests an approved stream session for an agent + camera.
     "agent_id": "0b91a1a8-...",
     "camera_id": "9c8c7e3e-...",
     "state": "approved",
-    "srt_url": "srt://ingest.upstream.tv:8890?streamid=publish:...",
-    "streamid": "publish:...",
+    "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
+    "streamid": "publish:sess_<hex>",
     "expires_at": "2026-05-13T06:00:00Z",
     "started_at": null,
     "ended_at": null,
     "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" },
     "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" }
   },
-  "srt_url": "srt://ingest.upstream.tv:8890?streamid=publish:...",
+  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
   "session_token": "eyJhbGciOiJIUzI1NiI...",
   "expires_at": "2026-05-13T06:00:00Z"
 }
