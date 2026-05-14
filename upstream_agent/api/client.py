@@ -40,6 +40,7 @@ from upstream_agent.api.schemas import (
     Heartbeat,
     HeartbeatBatchRequest,
     HeartbeatBatchResponse,
+    Session,
     StopStreamSessionRequest,
     StopStreamSessionResponse,
     StreamSessionRequest,
@@ -69,6 +70,11 @@ CAMERA_REGISTER_PATH: str = "/v1/cameras/register"
 STREAM_SESSION_START_PATH: str = "/v1/stream-sessions/start"
 # Path-interpolated. Build with .format(session_id=...).
 STREAM_SESSION_STOP_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}/stop"
+# Read a single session's current state. Returns the flat session
+# record (Session in :mod:`upstream_agent.api.schemas`) — the M7
+# recovery path polls this after FFmpeg starts to confirm remote
+# ingest is live before declaring the stream up.
+STREAM_SESSION_GET_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}"
 # Heartbeat endpoint takes ``agent_id`` as a query parameter, not a path part.
 HEARTBEAT_PATH: str = "/v1/heartbeats"
 
@@ -183,6 +189,26 @@ class UpstreamApiClient:
             "POST", path, StopStreamSessionRequest(), StopStreamSessionResponse
         )
 
+    def get_stream_session(self, session_id: str) -> Session:
+        """Read the current state of a stream session.
+
+        Used by the M7 recovery path: after a fresh
+        :meth:`start_stream_session` and FFmpeg startup, the supervisor
+        polls this endpoint until the server-side ``state`` flips to
+        ``"streaming"`` — i.e. MediaMTX's ingest webhook has confirmed
+        the stream is live. Local FFmpeg startup alone is **not** proof
+        that the dashboard can see frames; only the API can confirm
+        remote ingest.
+
+        Errors are translated via the same typed
+        :class:`~upstream_agent.errors.ApiError` mapping as every other
+        endpoint. A 404 surfaces as :class:`ApiValidationError`
+        (fatal — unknown session id).
+        """
+
+        path = STREAM_SESSION_GET_PATH_TEMPLATE.format(session_id=session_id)
+        return self._request("GET", path, None, Session)
+
     def send_heartbeat(
         self, *, agent_id: str, heartbeat: Heartbeat
     ) -> HeartbeatBatchResponse:
@@ -221,19 +247,19 @@ class UpstreamApiClient:
         self,
         method: str,
         path: str,
-        body: BaseModel,
+        body: BaseModel | None,
         response_model: type[T],
         *,
         params: dict[str, str] | None = None,
     ) -> T:
         headers = {
             **self._build_auth_header(),
-            "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        payload = body.model_dump(mode="json", exclude_none=True)
-
-        request_kwargs: dict[str, Any] = {"headers": headers, "json": payload}
+        request_kwargs: dict[str, Any] = {"headers": headers}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            request_kwargs["json"] = body.model_dump(mode="json", exclude_none=True)
         if params is not None:
             request_kwargs["params"] = params
 

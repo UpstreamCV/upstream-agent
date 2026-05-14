@@ -41,10 +41,18 @@ from upstream_agent.errors import (
     FfmpegExitError,
     FfmpegStartError,
     FfmpegWriteError,
-    StreamingRuntimeError,
 )
+from upstream_agent.runtime.backoff import BackoffPolicy
 from upstream_agent.sources.base import FrameInfo, VideoSource
 from upstream_agent.supervisor import RunResult, run_agent
+
+
+def _fast_backoff() -> BackoffPolicy:
+    """Backoff with zero delays so reconnect tests don't wall-sleep."""
+
+    return BackoffPolicy(
+        initial=0.0, multiplier=1.0, max_delay=0.0, jitter_factor=0.0
+    )
 
 # Placeholder values — must not appear in any log/event/result.
 SECRET_SRT_URL = "srt://stream.test.local:8890/?streamid=RUN_TEST_SECRET"
@@ -195,6 +203,7 @@ class FakeApiClient:
         approved_latency_mode: str = "balanced",
         srt_url: str | None = SECRET_SRT_URL,
         agent_raises: Exception | None = None,
+        get_session_states: list[str] | None = None,
     ) -> None:
         self._approved = ApprovedStreamConfig(
             width=approved_width,
@@ -206,10 +215,12 @@ class FakeApiClient:
         )
         self._srt_url = srt_url
         self._agent_raises = agent_raises
+        self._get_session_states: list[str] = list(get_session_states or [])
         self.register_agent_calls: list[AgentRegisterRequest] = []
         self.register_camera_calls: list[CameraRegisterRequest] = []
         self.start_session_calls: list[StreamSessionRequest] = []
         self.stop_session_calls: list[str] = []
+        self.get_session_calls: list[str] = []
 
     def __enter__(self) -> FakeApiClient:
         return self
@@ -257,6 +268,26 @@ class FakeApiClient:
     def stop_stream_session(self, session_id: str) -> StopStreamSessionResponse:
         self.stop_session_calls.append(session_id)
         return StopStreamSessionResponse()
+
+    def get_stream_session(self, session_id: str) -> Session:
+        self.get_session_calls.append(session_id)
+        # Default: report the session as ``streaming`` so the
+        # supervisor's M7.2 ingest-confirmation wait returns
+        # immediately. Tests that want a different sequence of
+        # states swap in via ``get_session_states`` (FIFO).
+        if self._get_session_states:
+            state = self._get_session_states.pop(0)
+        else:
+            state = "streaming"
+        return Session(
+            id=session_id,
+            state=state,
+            camera_id="cam_1",
+            srt_url=self._srt_url,
+            streamid=SECRET_STREAMID,
+            requested=None,
+            approved=self._approved,
+        )
 
 
 def _cfg() -> Config:
@@ -376,11 +407,15 @@ def test_happy_path_completes_max_frames_and_cleans_up_in_order() -> None:
     assert len(ffmpeg.write_calls) == 3
     assert ffmpeg.stop_calls == 1
 
-    # Event ordering: ffmpeg_stopped before camera_released before
-    # session_stopped.
+    # Event ordering: heartbeat_stopped → ffmpeg_stopped →
+    # session_stopped → camera_released. M7 moved session-stop into
+    # the per-attempt cleanup so the old session is released before
+    # the next attempt starts; camera close is outer cleanup. The
+    # safe-shutdown contract (no zombie FFmpeg, no leaked sessions)
+    # is unchanged.
     stages = [stage for stage, _ in events]
-    assert stages.index("ffmpeg_stopped") < stages.index("camera_released")
-    assert stages.index("camera_released") < stages.index("session_stopped")
+    assert stages.index("ffmpeg_stopped") < stages.index("session_stopped")
+    assert stages.index("session_stopped") < stages.index("camera_released")
 
 
 def test_capabilities_payload_reflects_probe() -> None:
@@ -459,6 +494,8 @@ def test_uses_server_approved_resolution_not_local_request() -> None:
 
 
 def test_ffmpeg_start_failure_still_stops_session_and_releases_camera() -> None:
+    """FfmpegStartError is classified as fatal — propagates without retry."""
+
     bad_ffmpeg = FakeFfmpeg([], [], start_raises=FfmpegStartError("boom"))
     factories = _make_factories(ffmpeg=bad_ffmpeg)
 
@@ -470,6 +507,7 @@ def test_ffmpeg_start_failure_still_stops_session_and_releases_camera() -> None:
             ffmpeg_factory=factories["ffmpeg_factory"],
             ffmpeg_probe=_happy_probe(),
             max_frames=3,
+            backoff=_fast_backoff(),
         )
 
     cam: FakeCamera = factories["cam"]
@@ -480,6 +518,9 @@ def test_ffmpeg_start_failure_still_stops_session_and_releases_camera() -> None:
 
 
 def test_frame_write_failure_cleans_up_everything() -> None:
+    """With ``max_attempts=1`` the supervisor reproduces pre-M7 fail-fast:
+    one attempt, recoverable failure, re-raise the typed exception."""
+
     bad_ffmpeg = FakeFfmpeg([], [], write_raises_after=2)
     factories = _make_factories(ffmpeg=bad_ffmpeg)
 
@@ -491,6 +532,8 @@ def test_frame_write_failure_cleans_up_everything() -> None:
             ffmpeg_factory=factories["ffmpeg_factory"],
             ffmpeg_probe=_happy_probe(),
             max_frames=10,
+            max_attempts=1,
+            backoff=_fast_backoff(),
         )
 
     cam: FakeCamera = factories["cam"]
@@ -512,6 +555,8 @@ def test_camera_read_failure_stops_ffmpeg_and_session() -> None:
             ffmpeg_factory=factories["ffmpeg_factory"],
             ffmpeg_probe=_happy_probe(),
             max_frames=10,
+            max_attempts=1,
+            backoff=_fast_backoff(),
         )
 
     ffmpeg: FakeFfmpeg = factories["ffmpeg_holder"][0]
@@ -533,6 +578,8 @@ def test_ffmpeg_exit_mid_stream_raises_ffmpeg_exit_error_and_cleans_up() -> None
             ffmpeg_factory=factories["ffmpeg_factory"],
             ffmpeg_probe=_happy_probe(),
             max_frames=10,
+            max_attempts=1,
+            backoff=_fast_backoff(),
         )
     assert "139" in str(exc_info.value)
 
@@ -544,10 +591,14 @@ def test_ffmpeg_exit_mid_stream_raises_ffmpeg_exit_error_and_cleans_up() -> None
 
 
 def test_api_failure_does_not_start_ffmpeg() -> None:
+    """An auth-class API failure is fatal — the typed ApiAuthError
+    propagates directly. M7 dropped the M5/M6 StreamingRuntimeError
+    wrapper so callers can branch on the original error class."""
+
     client = FakeApiClient(agent_raises=ApiAuthError("token rejected"))
     factories = _make_factories(client=client)
 
-    with pytest.raises(StreamingRuntimeError):
+    with pytest.raises(ApiAuthError):
         run_agent(
             _cfg(), _state(),
             camera_factory=factories["camera_factory"],
@@ -555,6 +606,8 @@ def test_api_failure_does_not_start_ffmpeg() -> None:
             ffmpeg_factory=factories["ffmpeg_factory"],
             ffmpeg_probe=_happy_probe(),
             max_frames=10,
+            max_attempts=1,
+            backoff=_fast_backoff(),
         )
 
     # No ffmpeg was ever constructed (factory not called) because the

@@ -12,16 +12,25 @@ spawns one daemon :class:`threading.Thread` whose loop:
    :meth:`stop` wakes the thread immediately rather than waiting out
    the interval.
 
-Failure handling is intentionally minimal for Milestone 6:
+Failure handling is intentionally minimal:
 
 * **Transient failure** (connection error, 5xx, 429, any other
-  ``ApiError``): log a warning and try again next tick. No exponential
-  backoff — that belongs to Milestone 7.
+  ``ApiError``): log a warning and try again next tick. The exponential
+  backoff added in Milestone 7 lives on the supervisor's recovery
+  loop, not here — the reporter's job is to be loud about failures,
+  not to retry.
 * **Fatal failure** (``ApiTokenRevokedError``, ``ApiTokenExpiredError``,
   ``ApiValidationError``): stop the thread and store a reason string.
   The supervisor polls :meth:`fatal_reason` after each frame; if it
   becomes non-``None``, the streaming loop exits cleanly with
   ``exit_reason="fatal_heartbeat"``.
+
+The outgoing :class:`HeartbeatStatus` is derived directly from
+``stats.snapshot().ffmpeg_running``: ``"streaming"`` while FFmpeg is
+alive and we have a session, ``"error"`` otherwise. The reporter is
+session-scoped — it is torn down between recovery attempts — so the
+``"reconnecting"`` literal in the schema is not used in practice and
+no heartbeats are sent during the reconnect gap.
 
 Logging policy: the reporter only emits the typed-error string from
 :class:`~upstream_agent.api.client.UpstreamApiClient`, which already

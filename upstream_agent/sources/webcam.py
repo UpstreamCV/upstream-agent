@@ -20,6 +20,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import platform
 from typing import Any
 
 from upstream_agent.config import CameraConfig
@@ -75,7 +76,17 @@ class WebcamSource(VideoSource):
     def open(self) -> None:
         cv2 = _import_cv2()
         source = self._cfg.source
-        cap = cv2.VideoCapture(source)
+
+        # On macOS, request the AVFoundation backend explicitly so the
+        # default backend selection isn't ambiguous (OpenCV could
+        # otherwise pick a different backend depending on its build).
+        # On other platforms (Linux/Windows) leave the backend choice
+        # to OpenCV's default — passing AVFoundation there would fail.
+        cap_backend = getattr(cv2, "CAP_AVFOUNDATION", None)
+        if platform.system() == "Darwin" and cap_backend is not None:
+            cap = cv2.VideoCapture(source, cap_backend)
+        else:
+            cap = cv2.VideoCapture(source)
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cfg.requested_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cfg.requested_height)

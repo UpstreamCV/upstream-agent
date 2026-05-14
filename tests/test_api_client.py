@@ -26,6 +26,7 @@ import pytest
 from upstream_agent.api.client import (
     AGENT_REGISTER_PATH,
     CAMERA_REGISTER_PATH,
+    STREAM_SESSION_GET_PATH_TEMPLATE,
     STREAM_SESSION_START_PATH,
     STREAM_SESSION_STOP_PATH_TEMPLATE,
     UpstreamApiClient,
@@ -696,3 +697,120 @@ def test_base_url_trailing_slash_is_normalised() -> None:
     finally:
         client.close()
     assert cap.requests[0].url.path == AGENT_REGISTER_PATH
+
+
+# ---------------------------------------------------------------------------
+# get_stream_session — M7 remote-ingest confirmation
+# ---------------------------------------------------------------------------
+
+
+_FLAT_SESSION_BODY = {
+    "id": "0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e",
+    "account_id": "00000000-0000-0000-0000-000000000001",
+    "agent_id": "agent_1",
+    "camera_id": "cam_1",
+    "state": "approved",
+    "srt_url": "srt://ingest.test.local:8890?streamid=publish:sess_secret",
+    "streamid": "publish:sess_secret",
+    "expires_at": "2026-05-14T13:00:00Z",
+    "created_at": "2026-05-14T12:00:00Z",
+    "started_at": "2026-05-14T12:00:01Z",
+    "ended_at": None,
+    "requested": {
+        "width": 1280, "height": 720, "fps": 30, "codec": "h264",
+        "bitrate_kbps": 3000, "latency_mode": "balanced",
+    },
+    "approved": {
+        "width": 1280, "height": 720, "fps": 30, "codec": "h264",
+        "bitrate_kbps": 3000, "latency_mode": "balanced",
+    },
+}
+
+
+def test_get_stream_session_returns_flat_session_with_state() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = dict(_FLAT_SESSION_BODY)
+        body["state"] = "streaming"
+        return httpx.Response(200, json=body)
+
+    client, cap = _make_client(handler)
+    with client:
+        session = client.get_stream_session("sess_42")
+
+    assert session.id == _FLAT_SESSION_BODY["id"]
+    assert session.state == "streaming"
+    assert cap.requests[0].method == "GET"
+    assert cap.requests[0].url.path == STREAM_SESSION_GET_PATH_TEMPLATE.format(
+        session_id="sess_42"
+    )
+    # GET requests must not include a JSON Content-Type or a request body.
+    body_bytes = cap.requests[0].content
+    assert body_bytes == b""
+    assert "content-type" not in {k.lower() for k in cap.requests[0].headers}
+
+
+def test_get_stream_session_sends_bearer_auth_and_accept_json() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_FLAT_SESSION_BODY)
+
+    client, cap = _make_client(handler)
+    with client:
+        client.get_stream_session("sess_42")
+    headers = {k.lower(): v for k, v in cap.requests[0].headers.items()}
+    assert headers["authorization"] == f"Bearer {TOKEN}"
+    assert headers["accept"] == "application/json"
+
+
+def test_get_stream_session_404_maps_to_validation_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404, json={"error": {"code": "session_not_found", "message": "no"}}
+        )
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiValidationError):
+        client.get_stream_session("sess_missing")
+
+
+def test_get_stream_session_401_token_revoked_maps_to_token_revoked() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401, json={"error": {"code": "token_revoked", "message": "no"}}
+        )
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiTokenRevokedError):
+        client.get_stream_session("sess_42")
+
+
+def test_get_stream_session_5xx_maps_to_server_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"code": "x", "message": "y"}})
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiServerError):
+        client.get_stream_session("sess_42")
+
+
+def test_get_stream_session_connection_error_maps_to_connection_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network down")
+
+    client, _ = _make_client(handler)
+    with client, pytest.raises(ApiConnectionError):
+        client.get_stream_session("sess_42")
+
+
+def test_get_stream_session_error_response_carries_no_token_leak() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"error": {"code": "x", "message": "y", "request_id": "rid"}},
+        )
+
+    client, _ = _make_client(handler)
+    with client:
+        try:
+            client.get_stream_session("sess_42")
+        except ApiError as exc:
+            assert TOKEN not in str(exc)

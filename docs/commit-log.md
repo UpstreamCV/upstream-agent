@@ -32,6 +32,1035 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-14 - cleanup: honest recovery logging + macOS camera limitation
+
+### Summary
+Fourth and final pass on the M7 live smoke. Goal was to audit
+the recovery code, remove patches that only labelled things,
+and make the remaining behaviour honest rather than
+optimistic. No new features. No new API endpoints. No new YAML
+knobs.
+
+The user reported two persistent issues:
+
+1. **Wi-Fi/network recovery logs claim the stream is back
+   online, but the dashboard video does not always come back.**
+   The previous patches had added a stack of cosmetic helpers
+   that did not change behaviour — they only labelled
+   failures. The real problem is that the agent's strongest
+   remote signal (`GET /v1/stream-sessions/{id}` →
+   `state="streaming"`) only proves *initial* MediaMTX ingest.
+   The API has no signal for ongoing dashboard playback.
+2. **Camera reopen never recovers on real hardware.** The
+   in-process recovery loop is structurally correct (fresh
+   `WebcamSource` + fresh `cv2.VideoCapture` per attempt, with
+   settle + windowed validation), but macOS / AVFoundation
+   caches device handles per-process. When an iPhone
+   Continuity Camera leaves range, `cv2.VideoCapture(N)` still
+   "opens" but every read returns no frame, *forever*. No
+   in-process action can flush that cache. Process restart is
+   the only honest fix.
+
+This change is mostly **deletions** and **honest rewording**,
+plus one small camera improvement: explicit
+`cv2.CAP_AVFOUNDATION` on macOS for backend determinism and a
+new `camera_unavailable_hint` event after N failed reopen
+cycles that tells the operator to restart the agent.
+
+### Files touched
+- `upstream_agent/runtime/stats.py` — dropped `RuntimePhase`,
+  `set_phase`, `_phase`, and `StatsSnapshot.phase`. Reverted
+  the snapshot to the M6-era shape.
+- `upstream_agent/runtime/__init__.py` — dropped `RuntimePhase`
+  export.
+- `upstream_agent/heartbeat/reporter.py` — replaced the
+  `_phase_to_status(snapshot)` helper with the M6-era inline
+  `status = "streaming" if snapshot.ffmpeg_running else "error"`.
+  The schema literal `"reconnecting"` stays (harmless,
+  forward-compatible) but the agent's code paths no longer
+  emit it. Updated the module docstring to be honest about
+  why: the reporter is session-scoped and torn down between
+  recovery attempts, so a `"reconnecting"` heartbeat would
+  require a session-independent reporter that is out of M7
+  scope.
+- `upstream_agent/supervisor.py`
+  - Removed the entire `_NETWORK_FAILURE_PATTERNS` /
+    `_NETWORK_FAILURE_EXIT_CODES` / `_looks_like_network_failure`
+    / `_failure_tag` block. The classifier was logging-only;
+    both kinds of recoverable stream failures retry
+    identically.
+  - Removed the `network_failure` event emission. The
+    `reconnecting` event already carries the same
+    information via `outcome.error_message` (which includes
+    the scrubbed FFmpeg stderr snippet).
+  - Removed the `stream_resumed` event and the
+    `had_recoverable_failure` / `recovery_cycles` bookkeeping
+    that fed it.
+  - Removed every `stats.set_phase(...)` call.
+  - Rewrote the `waiting_for_ingest` / `ingest_confirmed` /
+    `streaming` / `reconnecting` event messages so they
+    state what the agent can prove and nothing more.
+    Specifically:
+    - `waiting_for_ingest`: "FFmpeg started; waiting for API
+      to report session streaming"
+    - `ingest_confirmed`: "API reports session streaming
+      (MediaMTX confirmed initial ingest). Dashboard playback
+      is not directly verified."
+    - `streaming`: "Streaming started (frames flowing to
+      streaming server). Press Ctrl+C to stop."
+    - `reconnecting`: "Recoverable failure; cleanup complete,
+      will retry. {error_message}" — no `kind=...` tag.
+  - Added `_CAMERA_UNAVAILABLE_HINT_AFTER = 3` constant and
+    `camera_unavailable_hint_after` kwarg on
+    `_reopen_camera_with_backoff` and `run_agent`.
+  - After N consecutive failed reopen cycles inside
+    `_reopen_camera_with_backoff`, emit a single
+    `camera_unavailable_hint` event:
+    `"Camera device has opened but failed to produce frames
+    for {N} consecutive recovery cycles. On macOS / Continuity
+    Camera this often requires restarting the agent. The
+    agent will keep retrying."` Fires at most once per
+    recovery cycle.
+- `upstream_agent/sources/webcam.py` — on macOS pass the
+  explicit `cv2.CAP_AVFOUNDATION` backend to `VideoCapture`
+  for backend determinism. Defensive: `getattr(cv2,
+  "CAP_AVFOUNDATION", None)` so the test fakes that lack the
+  constant still work, and non-macOS platforms keep OpenCV's
+  default backend selection.
+- `tests/test_runtime_stats.py` — dropped
+  `test_set_phase_round_trip`; removed the `phase == "idle"`
+  line from `test_initial_snapshot_is_empty`.
+- `tests/test_heartbeat_reporter.py` — dropped
+  `test_reporter_status_is_reconnecting_when_phase_set` and
+  `test_reporter_status_is_error_when_phase_stopping`. The
+  shared `_make_reporter` helper no longer calls `set_phase`.
+- `tests/test_supervisor_recovery.py`
+  - Deleted the network-classification tests (5):
+    `test_ffmpeg_io_error_is_classified_as_network_failure`,
+    `test_ffmpeg_exit_code_251_classified_as_network`,
+    `test_generic_ffmpeg_failure_is_not_classified_as_network`,
+    `test_network_failure_triggers_fresh_session_restart`,
+    `test_no_secret_leak_in_network_failure_events`.
+  - Deleted the cosmetic `stream_resumed` tests (2):
+    `test_stream_resumed_event_fires_after_recoverable_failure`,
+    `test_stream_resumed_does_not_fire_on_clean_first_run`.
+  - Replaced
+    `test_phase_flips_to_reconnecting_between_attempts` with
+    `test_reporter_is_torn_down_between_attempts` (now the
+    honest assertion: one reporter per attempt, each started
+    and stopped exactly once).
+  - Added `test_ingest_confirmed_event_uses_honest_message` —
+    asserts the new wording and the absence of "Remote ingest
+    confirmed".
+  - Added
+    `test_streaming_event_message_does_not_claim_dashboard_visibility`
+    — asserts the new "Streaming started (frames flowing to
+    streaming server)" wording.
+  - Added `test_camera_unavailable_hint_fires_after_N_failed_cycles`
+    — five reopen cycles with a `fail_all_reads=True` camera
+    fire the hint exactly once, then the recovery proceeds to
+    a healthy camera and streaming resumes.
+- `docs/architecture.md` — replaced the
+  "Runtime recovery (Milestone 7)" section with a shorter,
+  honest version: "What the agent CAN prove" / "What the
+  agent CANNOT prove" / recovery loop / camera contract /
+  macOS Continuity Camera limitation / Ctrl+C semantics /
+  hidden test knobs / heartbeat status mapping.
+- `docs/module-map.md` — dropped `RuntimePhase` from the
+  `runtime/__init__.py` and `runtime/stats.py` rows. Updated
+  `heartbeat/reporter.py` to describe the simpler status
+  mapping. Updated `supervisor.py` to mention the new
+  `camera_unavailable_hint_after` kwarg and drop references
+  to deleted helpers. Updated `sources/webcam.py` to mention
+  the explicit AVFoundation backend on macOS.
+- `docs/troubleshooting.md` — rewrote the "Camera unplug" and
+  "Remote ingest confirmation" sections with the new event
+  wording. Added a "macOS Continuity Camera limitation"
+  subsection that explicitly says restart-the-agent is the
+  honest fix. Added a "Why dashboard playback may not match
+  agent logs" subsection.
+- `docs/api-contracts.md` — added an M7.3 note on the
+  freshness of the `state` field: the per-session state is
+  fresh-by-construction but sticky (no TTL), and the agent's
+  `ingest_confirmed` event explicitly does not claim ongoing
+  dashboard visibility.
+
+### Functions/classes changed
+- `RuntimePhase`, `RuntimeStats.set_phase`,
+  `StatsSnapshot.phase` — removed.
+- `_phase_to_status` (in `heartbeat/reporter.py`) — removed;
+  replaced by inline status mapping.
+- `_NETWORK_FAILURE_PATTERNS`,
+  `_NETWORK_FAILURE_EXIT_CODES`,
+  `_looks_like_network_failure`, `_failure_tag` — all removed
+  from `supervisor.py`.
+- `_CAMERA_UNAVAILABLE_HINT_AFTER` (new constant in
+  `supervisor.py`).
+- `_reopen_camera_with_backoff` — added
+  `unavailable_hint_after` kwarg and the
+  `camera_unavailable_hint` event emission.
+- `run_agent` — added `camera_unavailable_hint_after` kwarg;
+  removed the network-failure event emission and the
+  `stream_resumed` / `had_recoverable_failure` /
+  `recovery_cycles` bookkeeping.
+- `WebcamSource.open` — passes `cv2.CAP_AVFOUNDATION` on
+  macOS when the constant is available.
+
+### System interaction notes
+The `reconnecting` heartbeat status is no longer emitted by
+the agent's code. The literal stays in the schema for forward
+compatibility (a future, session-independent reporter could
+emit it without an API change). Today every heartbeat is
+either `streaming` (FFmpeg up) or `error` (FFmpeg down or
+torn down).
+
+The `camera_unavailable_hint` event fires at most once per
+recovery cycle (the `hint_emitted` flag inside
+`_reopen_camera_with_backoff` is local to each invocation).
+A camera that briefly comes back and then disappears again
+will re-enter the helper and the counter resets — that is the
+intended behaviour: each cycle is its own diagnostic.
+
+The macOS `CAP_AVFOUNDATION` change is a no-op on Linux/CI
+because `getattr(cv2, "CAP_AVFOUNDATION", None)` returns
+`None` outside macOS / the existing test fakes. Production
+macOS gets deterministic backend selection.
+
+### Testing/checks
+- `pytest -q` — 367 tests pass (down from 374: removed 7
+  cosmetic tests, added 3 honest-wording + camera-hint
+  tests).
+- `ruff check upstream_agent tests` — 5 baseline warnings
+  unchanged (4 × B008 typer.Option, 1 × I001 in
+  `tests/test_token_redaction.py`). No new warnings.
+- Manual smoke (still to run on the macbook with live API +
+  MediaMTX):
+  1. Unplug webcam mid-stream. After 3 reopen cycles with no
+     frames produced, expect exactly one
+     `camera_unavailable_hint` line. The agent keeps
+     retrying; replug a USB camera and confirm it eventually
+     recovers; for Continuity Camera, expect the hint message
+     to be the right advice.
+  2. Drop Wi-Fi mid-stream. Expect the new event wording:
+     `reconnecting` (no `kind=...`) → `reconnect_wait` →
+     `api_approved` → `ffmpeg_started` →
+     `waiting_for_ingest` (new message) → `ingest_confirmed`
+     (new message — does not claim dashboard visibility) →
+     `streaming` (new message — does not claim dashboard
+     visibility).
+  3. `kill -9 <ffmpeg-pid>` → expect the same recovery flow.
+  4. Ctrl+C during a backoff → immediate clean exit.
+  5. `grep -E 'srt://|streamid|session_token' ~/.upstream/logs/*`
+     — must be empty.
+
+### Follow-up TODOs
+- The macOS Continuity Camera limitation is a known
+  in-process recovery gap and is now documented honestly in
+  `docs/architecture.md` and `docs/troubleshooting.md`. There
+  is no smaller code fix; the only paths forward would be
+  out-of-process recovery (subprocess + restart-on-failure)
+  or a streaming-server-side push channel.
+- The `reconnecting` heartbeat status is not emitted today.
+  If product wants the dashboard to show a distinct
+  "reconnecting" badge during recovery, the agent would need
+  a session-independent reporter. Out of scope for M7.
+
+---
+
+## 2026-05-14 - fix: remote ingest confirmation + settle/windowed camera validation
+
+### Summary
+Third pass on the M7 live smoke. Two issues surfaced when
+testing against a real backend + dashboard:
+
+1. **Network/SRT recovery is not remotely verified.** After
+   FFmpeg restart, the agent emitted "Streaming started" and
+   marked the heartbeat as streaming — but the dashboard
+   stream often did not come back. The root cause: local
+   FFmpeg startup is not proof of remote ingest. MediaMTX
+   must accept the SRT publish and fire its `runOnReady`
+   webhook before the API session state transitions from
+   `approved` to `streaming`, and only then can the dashboard
+   serve the stream. The agent now polls
+   `GET /v1/stream-sessions/{id}` after FFmpeg starts and
+   waits for `state == "streaming"` before declaring success.
+2. **Camera recovery still loops on real hardware.** The
+   3-consecutive-reads validator added in the previous patch
+   was still too strict: USB / Continuity / V4L2 cameras can
+   take a couple of seconds to actually warm up and produce
+   frames, and they sometimes drop a transient read in the
+   middle of a settling stream. The validator now waits a
+   settle period after open, then accepts up to a window of
+   real time during which it can retry past transient
+   failures, only giving up if the window expires.
+
+No new API endpoint was needed for Issue 1 — `GET
+/v1/stream-sessions/{session_id}` was already shipped by the
+API server; the agent simply did not call it. The new client
+method (`get_stream_session`) reuses the existing typed-error
+mapping. No API contract changes; no new YAML config.
+
+### Files touched
+- `upstream_agent/api/client.py`
+  - Added `STREAM_SESSION_GET_PATH_TEMPLATE =
+    "/v1/stream-sessions/{session_id}"`.
+  - Added `get_stream_session(session_id) -> Session`
+    method. Returns the flat session record (the existing
+    `Session` schema, which already had a `state` field).
+  - Extended `_request` to accept `body: BaseModel | None`
+    so GET-style requests omit `Content-Type` and the JSON
+    body. Existing POST callers unchanged.
+- `upstream_agent/api/__init__.py` — re-exports
+  `STREAM_SESSION_GET_PATH_TEMPLATE`.
+- `upstream_agent/supervisor.py`
+  - New constants: `_INGEST_CONFIRM_TIMEOUT_S = 15.0`,
+    `_INGEST_POLL_INTERVAL_S = 0.5`,
+    `_CAMERA_RECOVERY_SETTLE_S = 1.5`,
+    `_CAMERA_RECOVERY_VALIDATION_WINDOW_S = 5.0`,
+    `_CAMERA_RECOVERY_READ_RETRY_S = 0.1`,
+    `_CAMERA_RELEASE_SETTLE_S = 0.5`.
+  - New internal `_IngestSkip(BaseException)` sentinel for
+    "shutdown during ingest wait" so the supervisor's blanket
+    `except Exception` does not classify shutdown as a
+    recoverable failure.
+  - New `_wait_for_remote_ingest(...)` helper. Pumps frames
+    into FFmpeg while polling `client.get_stream_session` at
+    the configured interval until `state == "streaming"` or
+    the timeout fires. Transient API failures
+    (`ApiConnectionError` / `ApiServerError` /
+    `ApiRateLimitError` / `ApiContractError`) emit an
+    `ingest_poll_transient_error` event and keep polling.
+    Fatal API errors propagate. Terminal session states
+    (`ended` / `expired` / `failed`) raise a
+    `StreamingRuntimeError` flagged for recoverable retry.
+    FFmpeg or camera failures during pre-warm propagate via
+    their existing typed-error paths.
+  - `_run_attempt` now calls `_wait_for_remote_ingest`
+    between `ffmpeg.start()` and the heartbeat reporter
+    start. The reporter only starts after `ingest_confirmed`;
+    `streaming` only fires after the reporter starts.
+    Pre-warm frames count toward the attempt's
+    `frames_written` so `max_frames` still works.
+  - Replaced the consecutive-read validator with a windowed
+    `_validate_camera_reads(target, window_s, retry_s, ...)`
+    that allows transient failures inside the window and
+    only gives up on window-expiry. Emits
+    `camera_validation_read_failed` per transient failure
+    and `camera_validation_timeout` on window-expiry.
+  - `_reopen_camera_with_backoff` now waits
+    `_CAMERA_RECOVERY_SETTLE_S` after every successful
+    `open()` and calls the windowed validator. Between
+    reopen attempts it also waits `_CAMERA_RELEASE_SETTLE_S`
+    so the driver fully releases the device. All wait
+    points are interruptible via the shared shutdown event.
+    A `try/finally` inside the helper ensures the camera is
+    closed even if `KeyboardInterrupt` raises from the
+    validator's read.
+  - `run_agent` exposes `ingest_timeout_s`,
+    `ingest_poll_interval_s`, `camera_settle_s`,
+    `camera_validation_window_s`, `camera_validation_frames`,
+    `camera_read_retry_s`, `camera_release_settle_s` as
+    optional kwargs so tests can dial these down to zero or
+    sub-second values without changing module-level defaults.
+- `tests/test_api_client.py` — 6 new tests for
+  `get_stream_session`: happy path returns flat Session
+  with `state`, sends GET without Content-Type/body, sends
+  Bearer + Accept JSON, 404 → `ApiValidationError`,
+  401+`token_revoked` → `ApiTokenRevokedError`, 5xx →
+  `ApiServerError`, network → `ApiConnectionError`, and a
+  token-leak guard on the error path.
+- `tests/test_supervisor.py` — `FakeApiClient.get_stream_session`
+  added (default `state="streaming"`, FIFO-list overrideable
+  via the `get_session_states` constructor kwarg).
+- `tests/test_supervisor_recovery.py`
+  - `FlakyApiClient.get_stream_session` added — supports
+    `get_session_states` FIFO, `get_session_raises` FIFO, and
+    `timeout_first_session` for clean two-attempt tests.
+  - `RecoveringCamera` gained `fail_all_reads=True` and
+    `keyboard_interrupt_after=N` knobs.
+  - `_FAST_INGEST` and `_FAST_CAMERA_TIMINGS` helpers so
+    recovery tests don't wall-sleep.
+  - 8 new ingest-wait tests:
+    - `test_ingest_state_streaming_starts_main_loop_and_heartbeat`
+    - `test_streaming_event_is_not_emitted_before_ingest_confirmed`
+    - `test_ingest_timeout_triggers_recoverable_retry`
+    - `test_ingest_transient_api_error_keeps_polling`
+    - `test_ingest_fatal_api_error_is_fatal`
+    - `test_ingest_terminal_state_is_recoverable`
+    - `test_keyboard_interrupt_during_ingest_wait_propagates`
+    - `test_ingest_wait_polls_multiple_times_before_confirm`
+    - `test_no_secrets_in_ingest_events`
+  - 3 new camera-validation tests (replacing the older
+    "abort on first failed read" ones, which described the
+    pre-windowed behaviour):
+    - `test_camera_open_succeeds_but_validation_fails_does_not_start_session`
+    - `test_camera_validation_tolerates_transient_failures_within_window`
+    - `test_repeated_validation_failures_do_not_tight_loop`
+  - 2 new camera-shutdown tests:
+    - `test_initial_camera_open_failure_is_fatal`
+    - `test_keyboard_interrupt_during_validation_window_propagates`
+- `docs/api-contracts.md` — new
+  "`GET /v1/stream-sessions/{session_id}`" section
+  documenting the request shape (no body, Bearer auth, no
+  query params required), the flat response schema, the
+  state-enum table (`approved` / `streaming` / `ended` /
+  `expired` / `failed`), and the error mapping. M7.2 note
+  added up top.
+- `docs/architecture.md` — "Camera recovery requires open +
+  multi-frame validation" subsection rewritten to describe
+  the settle + windowed validation contract. New
+  "Remote ingest must be confirmed before declaring
+  streaming" subsection with the failure-mode table.
+- `docs/troubleshooting.md` — "Camera unplug / reconnect"
+  section rewritten with the new event flow including
+  `camera_settle`, `camera_validation_read_failed`,
+  `camera_validation_timeout`, `camera_validated`. New
+  "Remote ingest confirmation" subsection covering the
+  `waiting_for_ingest` / `ingest_confirmed` lifecycle and
+  the `remote_ingest_timeout` recoverable path.
+- `docs/module-map.md` — `api/client.py` row updated for
+  `get_stream_session` and the new path constant.
+  `supervisor.py` row updated for the new kwargs and the
+  multi-phase recovery contract.
+
+### Functions/classes changed
+- `UpstreamApiClient.get_stream_session(session_id) -> Session`
+  (new) — GET-style call to the existing session-state
+  endpoint.
+- `UpstreamApiClient._request` — `body` is now
+  `BaseModel | None`; a `None` body omits Content-Type and
+  the JSON payload so the request goes out as a clean GET.
+- `_wait_for_remote_ingest(...)` (new) — pre-warm + poll
+  helper. Bounded, interruptible, leak-free.
+- `_validate_camera_reads(target, window_s, retry_s, ...)`
+  (replaced) — windowed validator tolerant of transient
+  read failures.
+- `_reopen_camera_with_backoff` — added settle + windowed
+  validation + release-settle. `try/finally` around the
+  camera so `KeyboardInterrupt` from the validator does
+  not leak the open device.
+- `_IngestSkip(BaseException)` (new) — control-flow sentinel
+  for shutdown during ingest wait.
+
+### System interaction notes
+The ingest wait writes frames into FFmpeg during the pre-warm
+phase — MediaMTX needs an active SRT publish before its
+`runOnReady` webhook fires. The pre-warm frame rate matches
+whatever the camera's `read_frame` produces (≈30 fps in
+production). The wait typically completes in 1–3 polls (≤1.5 s)
+on a healthy network; the 15 s timeout exists to bound the
+worst case where MediaMTX is rejecting the publish.
+
+If the timeout fires, the supervisor tears down the attempt
+and requests a brand-new stream session. The previous
+session's `streamid` is stopped via `stop_stream_session` so
+the streaming server doesn't see two concurrent publishes for
+the same camera.
+
+The heartbeat reporter is started only after
+`ingest_confirmed`. During the pre-warm window no heartbeats
+are sent. This is intentional: the dashboard reads
+`heartbeats.status == "streaming"` and the API's session
+`state == "streaming"` as the two signals that an agent is
+live; both should agree. Sending "streaming" heartbeats before
+ingest confirms would lie to the dashboard.
+
+The camera recovery now spends real time inside settle and
+validation windows. In production those add up to roughly
+6–7 s of wall clock per reopen attempt (1.5 s settle + ≤5 s
+validation window). Tests inject zero-or-tiny values via the
+new `camera_*_s` kwargs to keep the suite under 15 s total.
+
+### Testing/checks
+- `pytest -q` — 374 tests pass (340 from the M7 baseline +
+  prior camera-verification patches and the previous M7.1
+  patch; 9 new for ingest-wait + camera shutdown paths;
+  6 new for `get_stream_session`).
+- `ruff check upstream_agent tests` — 5 baseline warnings
+  unchanged (4 B008 typer-Option-in-default in `cli.py`,
+  1 I001 in `tests/test_token_redaction.py`). No new
+  categories.
+- Manual re-smoke plan (still to run on the macbook with
+  live API + MediaMTX):
+  1. Drop Wi-Fi mid-stream. Confirm the event sequence
+     includes `network_failure` → `reconnecting` →
+     `waiting_for_ingest` → `ingest_confirmed` →
+     `Streaming started` on the next attempt. Verify the
+     dashboard recovers within a few seconds of
+     `ingest_confirmed`.
+  2. Unplug the webcam mid-stream. Confirm `camera_settle`
+     and `camera_validation_read_failed` appear during
+     warm-up cycles, followed by `camera_validated`,
+     `waiting_for_ingest`, `ingest_confirmed`, and
+     `Streaming started`. No "camera reopen attempt #1"
+     repeating with no progress.
+  3. Start the agent with the webcam unplugged from the
+     start — confirm immediate `CameraOpenError` exit
+     (initial open is still fatal).
+  4. `grep -E 'srt://|streamid|session_token' ~/.upstream/logs/*`
+     after each — must be empty.
+
+### Follow-up TODOs
+- The 15 s ingest-wait timeout is hard-coded. If MediaMTX's
+  warm-up regularly takes longer than that on the customer
+  fleet, lift it to a YAML knob (`stream.ingest_timeout_s`
+  or similar). Not needed today.
+- The validator's settle / window constants are similarly
+  hard-coded. Operators reporting a slow-warming USB camera
+  could justify a YAML knob; not needed today.
+- Future API milestone: if the server adds a webhook /
+  push-notification path so the agent doesn't have to poll
+  `get_stream_session`, drop the polling in favour of a
+  blocking SSE stream or similar. The current contract has
+  no such surface.
+
+---
+
+## 2026-05-14 - fix: 3-frame camera recovery validation + SRT/network failure classification
+
+### Summary
+Second pass on the M7 smoke. Two issues surfaced live:
+
+1. The single-read camera verification added in the previous
+   patch was not strict enough. OpenCV's V4L2 backend would
+   sometimes return one stale buffered frame after `open()`, the
+   verifier would accept it, the supervisor would start a fresh
+   session + FFmpeg, and the **next** `read_frame` call (the
+   first one inside the live frame loop) would still raise
+   `CameraReadError`. The agent ended up in a tight
+   "camera reopened -> session start -> FFmpeg start -> read
+   failure -> session stop" cycle showing "camera reopen attempt
+   #1" repeatedly. Fixed by requiring 3 consecutive successful
+   frame reads before declaring recovery.
+2. Network / SRT drops were not clearly labelled in the event
+   stream. The supervisor classified them as
+   `recoverable_stream` and reconnected correctly, but operators
+   could not tell from the logs whether a particular failure
+   was "FFmpeg crashed" vs "SRT publish died." Added a small
+   classifier that inspects FFmpeg's exit code and stderr
+   snippet for SRT/network signatures and emits a dedicated
+   `network_failure` event. The supervisor also now emits
+   `stream_resumed` on the first attempt after a recoverable
+   cycle so it is easy to grep the log for "did the agent come
+   back."
+
+No API contract changes. No new YAML config knobs. No new API
+endpoints (a session-status GET would be nice; the API has
+none today).
+
+### Files touched
+- `upstream_agent/supervisor.py`
+  - Added `_CAMERA_RECOVERY_VALIDATION_FRAMES = 3` and a
+    new `_validate_camera_reads(cam, n, attempt, on_event)`
+    helper that reads up to N frames and returns False on the
+    first failure. The helper emits
+    `camera_validation_failed` events with the precise frame
+    index (`frame X/Y`) so the operator can tell which read in
+    the sequence failed.
+  - `_reopen_camera_with_backoff` now calls
+    `_validate_camera_reads` after every successful `open()`.
+    Validation failures stay inside the helper's backoff loop —
+    they don't escape, don't reset the shared `BackoffPolicy`,
+    and don't start a new session. On success the helper emits
+    `camera_validated` and returns the camera.
+  - Added a `validation_frames` keyword on
+    `_reopen_camera_with_backoff` so tests can dial the count
+    down. Production defaults to the module constant.
+  - Added the `_NETWORK_FAILURE_PATTERNS` /
+    `_NETWORK_FAILURE_EXIT_CODES` tables and the
+    `_looks_like_network_failure(message, *, exit_code=None)`
+    classifier. Patterns include `broken pipe`, `i/o error`,
+    `input/output error`, `connection refused`,
+    `connection reset`, `connection timed out`,
+    `no route to host`, `network is unreachable`,
+    `muxer error`, `av_interleaved_write_frame`, `srt`,
+    `rendezvous`. Exit codes include 251 (EIO), 255 (generic),
+    234 (EINVAL).
+  - Added `_failure_tag(outcome)` that uses the classifier to
+    return `"network"` or `"stream"` for a recoverable stream
+    outcome.
+  - The frame-loop FFmpeg-exit detection now calls
+    `ffmpeg.read_stderr_snippet()` (when available) and
+    attaches the scrubbed snippet to the `FfmpegExitError`
+    message so the classifier has stderr to inspect.
+  - The recovery loop now emits a dedicated
+    `network_failure` event when the kind is `network`, enriches
+    the `reconnecting` event message with the failure kind
+    (`Recoverable failure (kind=network|stream|camera); cleanup
+    complete, will retry. …`), and emits `stream_resumed`
+    before the next attempt's `streaming` event whenever a
+    recoverable cycle preceded it. Tracking is done via a local
+    `had_recoverable_failure` flag and a `recovery_cycles`
+    counter; both are scoped to the current `run_agent` call.
+- `upstream_agent/encoder/ffmpeg.py` — new public method
+  `FfmpegEncoderProcess.read_stderr_snippet()` that reads
+  whatever has been captured on the subprocess's stderr pipe,
+  scrubs SRT URLs, and caps at the existing 200-char limit.
+  Used by the supervisor's mid-stream-exit path to feed
+  classification.
+- `tests/test_encoder_ffmpeg.py` — 3 new tests:
+  empty-before-start, SRT-URL scrubbed and length-capped
+  snippet, and the missing-stderr-pipe no-op case.
+- `tests/test_supervisor_recovery.py` — 8 new tests:
+  - `test_camera_validation_aborts_if_any_read_in_sequence_fails`
+    — a camera whose read #2 raises after read #1 succeeds
+    must not pass validation; only 2 reads happen on that fake
+    before the validator gives up.
+  - `test_ffmpeg_io_error_is_classified_as_network_failure` —
+    a `FfmpegWriteError` whose stderr says "Input/output error"
+    fires the `network_failure` event.
+  - `test_ffmpeg_exit_code_251_classified_as_network` — an
+    `FfmpegExitError` with code 251 fires `network_failure`.
+  - `test_generic_ffmpeg_failure_is_not_classified_as_network`
+    — a plain failure ("encoder ran out of memory") does **not**
+    fire `network_failure` and reports `kind=stream`.
+  - `test_network_failure_triggers_fresh_session_restart` —
+    confirms the actual recovery actions (old session stop,
+    new session start, fresh FFmpeg) happen.
+  - `test_stream_resumed_event_fires_after_recoverable_failure`
+    — the event fires on the first attempt after a recovery
+    and ordering is "before the next `streaming` event."
+  - `test_stream_resumed_does_not_fire_on_clean_first_run` —
+    a happy-path run with no recoverable failure never emits
+    the event.
+  - `test_no_secret_leak_in_network_failure_events` — none of
+    the new events embed the SRT URL, streamid, session
+    token, or API token.
+  - The existing
+    `test_camera_open_succeeds_and_first_read_succeeds_proceeds_to_new_session`
+    test now asserts the recovered camera saw at least 4
+    reads (3 validation + ≥1 streaming) instead of the
+    previous "≥2".
+- `docs/architecture.md` — "Runtime recovery" section now
+  documents the multi-frame validation contract, the
+  `_failure_tag` classifier, and the local-vs-remote
+  visibility caveat.
+- `docs/troubleshooting.md` — "Camera unplug / reconnect"
+  section rewritten with the new event stream and validation
+  contract; new "Local encoder/SRT publish failed" subsection
+  with the classifier's pattern table; new "Local vs remote
+  stream visibility" subsection.
+
+### Functions/classes changed
+- `_validate_camera_reads(cam, n, attempt, on_event)` (new,
+  private) — N-frame read sequence with per-frame failure
+  events.
+- `_reopen_camera_with_backoff(..., validation_frames=3)` —
+  added the validation call after open. New `validation_frames`
+  test knob.
+- `_looks_like_network_failure(message, *, exit_code=None)`
+  (new) — text + exit-code SRT/network classifier.
+- `_failure_tag(outcome)` (new, private) — returns the
+  `network` / `stream` tag for event messages.
+- `FfmpegEncoderProcess.read_stderr_snippet()` (new) —
+  leak-free post-mortem stderr peek.
+- `run_agent` — added the `had_recoverable_failure` /
+  `recovery_cycles` bookkeeping, the enriched `reconnecting`
+  message, and the `network_failure` / `stream_resumed`
+  emissions.
+
+### System interaction notes
+The classifier is intentionally **conservative** — short list
+of patterns chosen to minimise false-positives. Broad terms
+like "error" or "failed" are not on the list because they
+appear in plenty of non-network FFmpeg output. The exit-code
+list mirrors what FFmpeg actually emits when libsrt's
+`srt_sendmsg` errors out: 251 (EIO) is the common one, 255 is
+the generic fallback, and 234 (EINVAL) sometimes surfaces on
+truncated streams. The classifier is informational only — it
+does not change the recovery action; both `network` and
+`stream` follow the same per-attempt stop-and-restart path.
+
+The 3-frame validation discards 3 frames per recovery cycle.
+Cameras that recover cleanly only pay this cost once; cameras
+that keep failing the validation never reach the streaming
+loop so the discarded frames are inconsequential. There is no
+new wall-clock cost beyond the existing backoff sleeps.
+
+The `stream_resumed` event tracking is per-`run_agent`-call,
+not persistent. A normal happy-path run never emits it. After
+a recovery cycle the event fires once per attempt until the
+agent exits.
+
+### Testing/checks
+- `pytest -q` — 356 tests pass (340 from the M7 baseline + 5
+  from the previous camera-verification patch + 8 new
+  recovery + 3 new encoder).
+- `ruff check upstream_agent tests` — 5 baseline warnings,
+  same as before (4 B008 typer-Option-in-default in `cli.py`,
+  1 I001 in `tests/test_token_redaction.py`). No new
+  categories introduced.
+- Manual re-smoke plan (still to run on the macbook with
+  live API + MediaMTX):
+  1. Unplug the webcam mid-stream. Confirm the event log
+     shows `camera_validation_failed` lines (with `frame X/Y`
+     indices) for any warm-up cycles, followed by
+     `camera_validated` and `stream_resumed`. Verify the
+     supervisor does **not** show repeated "camera reopen
+     attempt #1" with no progress.
+  2. Turn Wi-Fi off mid-stream. Confirm the event log shows a
+     `network_failure` line when FFmpeg/SRT eventually
+     errors, then the usual cycle of stop → backoff → new
+     session → `stream_resumed`. Confirm the detection
+     latency is 5–30 s on a typical macOS box (matches the
+     kernel's default SRT socket timeout window).
+  3. `grep -E 'srt://|streamid|session_token' ~/.upstream/logs/*`
+     after each — must be empty.
+
+### Follow-up TODOs
+- Consider exposing the `_CAMERA_RECOVERY_VALIDATION_FRAMES`
+  constant as a YAML knob if operators report it being too
+  strict (e.g., on a flaky USB camera that takes a few extra
+  seconds to settle). M7 ships with the constant fixed at 3.
+- Future API milestone: if the server adds a "get current
+  session state" GET, the supervisor could poll it during
+  suspected network gaps to detect remote disconnects faster
+  than waiting for FFmpeg's socket timeout. No such endpoint
+  exists today; do not invent one.
+
+---
+
+## 2026-05-14 - fix: verify camera recovery with a frame read before declaring success
+
+### Summary
+Live-smoke testing the M7 camera-unplug path exposed a tight loop:
+`VideoCapture.open()` on OpenCV's V4L2 backend can return success
+even when the device hasn't started producing frames yet. The
+supervisor treated that as recovered, started a fresh stream
+session, launched FFmpeg, hit `CameraReadError` on the very first
+read, tore it all down, and immediately re-entered the camera
+recovery loop. The recovery helper now performs a verification
+`read_frame()` after every successful `open()` and only returns
+the camera if both succeed. Open-but-no-frame failures stay
+inside `_reopen_camera_with_backoff`, sharing the same
+`BackoffPolicy` so the delay keeps growing. The supervisor also
+stops resetting the backoff after a "successful" camera recovery
+— consecutive recovery cycles now accumulate, capped at the
+configured `max_delay` (30 s).
+
+### Files touched
+- `upstream_agent/supervisor.py` — `_reopen_camera_with_backoff`
+  now reads one frame after `open()` and discards it; failures
+  (typed `CameraReadError`, unexpected `Exception`, or
+  `(False, None)`) close the camera and continue the backoff
+  loop. New `_safe_close(cam)` helper centralises the
+  swallow-all close pattern used in both the helper and the
+  outer recovery path. The outer recovery loop no longer calls
+  `backoff_policy.reset()` after a successful camera recovery.
+  Event messages distinguish `failed (open)` vs `failed (no
+  frame)` so the operator can tell which step actually failed.
+- `tests/test_supervisor_recovery.py` — five new tests:
+  `test_camera_open_succeeds_but_first_read_fails_does_not_start_session`
+  (no second `start_stream_session` call, no extra FFmpeg, both
+  bad-recovery cameras closed after exactly one read);
+  `test_camera_open_succeeds_and_first_read_succeeds_proceeds_to_new_session`
+  (happy path of the verification — one extra read on the
+  recovered camera, second session + second FFmpeg started);
+  `test_repeated_open_then_read_fails_does_not_tight_loop`
+  (records `BackoffPolicy.sleep` delays and asserts they
+  progress 1 → 2 → 4 → 8 s across consecutive open+read-fail
+  cycles, never restarting at the initial value);
+  `test_shutdown_during_camera_recovery_wait_exits_cleanly`
+  (fake sleep that sets the shutdown event returns
+  `keyboard_interrupt` cleanly);
+  `test_keyboard_interrupt_during_camera_recovery_wait_propagates`
+  (fake sleep that raises `KeyboardInterrupt` propagates through
+  outer cleanup to the caller).
+- `docs/troubleshooting.md` — "Camera unplug / reconnect"
+  section now documents the verified-recovery contract, the
+  two event-message reason strings (`failed (open)` vs
+  `failed (no frame)`), and the fact that backoff does not
+  reset between recovery cycles.
+
+### Functions/classes changed
+- `_reopen_camera_with_backoff` — added the verification read.
+- `_safe_close(cam)` (new, private) — best-effort
+  `cam.close()` that never raises; replaces three inline copies.
+
+### System interaction notes
+The verification read consumes one frame from the camera before
+the supervisor declares recovery. Stale frames at the start of
+capture are not useful, so discarding the first one is harmless;
+OpenCV's V4L2 backend in particular tends to deliver a stale
+buffered frame as the first read after `open()` anyway.
+
+Because backoff is no longer reset between camera recovery
+cycles, a chronically-flaky camera that briefly returns frames
+and then disconnects again will see growing delays between
+recovery attempts (1 s → 2 s → 4 s → … up to 30 s). For a
+camera that recovers cleanly, the agent still streams normally
+until the next failure — the cap just means a long pause if
+the device keeps failing.
+
+### Testing/checks
+- `pytest -q` — 345 tests pass (340 from M7 + 5 new in
+  `test_supervisor_recovery.py`).
+- `ruff check upstream_agent tests` — 5 baseline warnings only.
+- Manual live smoke (to be re-run on the macbook):
+  unplug the webcam mid-stream and confirm the event stream
+  shows `failed (open)` / `failed (no frame)` lines for any
+  warm-up cycles before `Camera reopened`. Re-plug and confirm
+  streaming resumes within one verification read.
+
+### Follow-up TODOs
+- None. The "going-offline" final heartbeat and
+  proactive-session-refresh items from the M7 entry are still
+  the next things to consider.
+
+---
+
+## 2026-05-14 - feat: reconnect, camera reopen, session restart (Milestone 7)
+
+### Summary
+Milestone 7 makes `upstream run` survive normal field failures
+without crashing. The supervisor now wraps the per-session work in a
+recovery loop with bounded exponential backoff (1 s → 30 s, ×2,
+±20 % jitter, interruptible by Ctrl+C). FFmpeg mid-stream exits,
+broken pipes, transient API connection / 5xx / 429 / contract
+errors, and mid-stream `CameraReadError` are all classified as
+recoverable: the attempt is torn down, a fresh stream session is
+requested from the API, and streaming resumes — or, for camera
+loss, the camera is closed and reopened with backoff before the
+next attempt. Auth / token / validation errors and unrecoverable
+FFmpeg failures (`FfmpegStartError`, `FfmpegNotFoundError`, etc.)
+stay fatal. The agent never reuses an SRT URL or session token
+across attempts; every retry asks the API for a new one. Ctrl+C is
+interrupt-able at every wait point (frame loop, inter-attempt
+backoff, camera-reopen backoff). No new API endpoints — recovery
+reuses the existing `POST /v1/stream-sessions/start` and
+`POST /v1/stream-sessions/{id}/stop`.
+
+### Files touched
+- `upstream_agent/runtime/backoff.py` (new) — `BackoffPolicy(*,
+  initial=1.0, multiplier=2.0, max_delay=30.0, jitter_factor=0.2,
+  rng=None)`. `next_delay()` advances the internal geometric step
+  capped at `max_delay`, with multiplicative jitter applied per
+  call; `reset()` returns to initial; `sleep(delay, shutdown)`
+  builds on `threading.Event.wait` so a shutdown event (or Ctrl+C
+  on the main thread) wakes the wait immediately. Defaults match
+  the M7 spec exactly. `rng` injection point lets tests assert
+  progression deterministically. Module-level constants
+  (`DEFAULT_INITIAL_DELAY_S`, etc.) are re-exported from
+  `runtime/__init__.py`.
+- `upstream_agent/runtime/__init__.py` — re-exports `BackoffPolicy`,
+  `RuntimePhase`, and the four backoff defaults.
+- `upstream_agent/runtime/stats.py` — added the
+  `RuntimePhase = Literal["idle", "streaming", "reconnecting",
+  "stopping"]` alias plus a `set_phase` method and a `phase` field
+  on `StatsSnapshot`. The heartbeat builder reads `phase` to pick
+  the wire `HeartbeatStatus`; the supervisor flips it as the
+  recovery loop transitions between attempts.
+- `upstream_agent/heartbeat/reporter.py` — `_build_heartbeat` now
+  calls a new private `_phase_to_status(snapshot)` helper: phase
+  `streaming` + `ffmpeg_running` → `streaming`; phase `reconnecting`
+  → `reconnecting`; everything else → `error`. Module docstring
+  updated to mention M7 phase wiring and the fact that the reporter
+  itself still has no backoff (transient `ApiError` keeps logging
+  warnings every 5 s).
+- `upstream_agent/supervisor.py` — split the body. The outer
+  `run_agent` opens the camera (initial open failure stays fatal),
+  opens the API client (shared across attempts), then runs a
+  recovery loop around a new private `_run_attempt` helper. Each
+  attempt owns one session / FFmpeg / heartbeat reporter and cleans
+  them up in its own `finally` (heartbeat → FFmpeg → session). The
+  outer loop classifies the per-attempt outcome via a new
+  `_classify(exc)` helper into fatal / recoverable_stream /
+  recoverable_camera; recoverable_stream sleeps via `BackoffPolicy`
+  before retrying, recoverable_camera calls a new
+  `_reopen_camera_with_backoff` helper. Two new private
+  registration helpers — `_register_if_needed` (idempotent agent +
+  camera registration) and `_start_session` — replace the M5/M6
+  call into `_obtain_stream_approval`; these propagate typed
+  `ApiError` subclasses so the classifier can branch correctly. The
+  `_obtain_stream_approval` orchestrator in `diagnostics/api.py` is
+  unchanged for `upstream check --api`. Two new hidden test knobs
+  on `run_agent`: `max_attempts: int | None = None` (default
+  unbounded; `1` reproduces pre-M7 fail-fast) and
+  `backoff: BackoffPolicy | None = None` (zero-delay policy for
+  fast tests). End-to-end shutdown order is now heartbeat → FFmpeg
+  → session (per-attempt) → camera → client (outer). The raw SRT
+  URL lives in a single local inside `_run_attempt` and is `del`'d
+  before attempt cleanup runs.
+- `tests/test_runtime_backoff.py` (new) — 15 tests covering default
+  progression (1 → 2 → 4 → 8 → 16 → 30 s with a zero-jitter rng),
+  `max_delay` clamp, `reset()`, jitter swing within
+  ±`jitter_factor`, validation rejection for bad
+  `initial` / `multiplier` / `max_delay` / `jitter_factor`, and the
+  interruptible-sleep contract: full wait returns `False`,
+  concurrent `event.set()` returns `True` quickly, already-set
+  event returns immediately, zero delay is a no-op that still
+  honors a set event.
+- `tests/test_supervisor_recovery.py` (new) — 13 supervisor
+  recovery-loop tests using `StepwiseFfmpeg`,
+  `RecoveringCamera`, `FlakyApiClient`, a `CapturingReporter`, and
+  a zero-delay backoff. Covers FFmpeg mid-stream exit triggering a
+  second attempt; broken-pipe write triggering the same path;
+  per-attempt session stop before the next start; transient
+  `ApiConnectionError` + `ApiServerError` retrying then succeeding;
+  `ApiTokenRevokedError` being fatal with no retry; mid-stream
+  `CameraReadError` closing and reopening the camera; reopen with
+  backoff after two `CameraOpenError`s; phase tracking; shutdown
+  during the backoff sleep returning early; `KeyboardInterrupt`
+  during the sleep propagating with full cleanup; `max_attempts=3`
+  re-raising the underlying exception; `stop_stream_session`
+  failure being logged but not fatal; and a leak guard that asserts
+  no SRT URL / streamid / session token / API token appears in any
+  event or caplog record during a multi-attempt cycle.
+- `tests/test_runtime_stats.py` — added `set_phase` round-trip test
+  and updated the empty-snapshot assertion for the new `phase`
+  field (default `"idle"`).
+- `tests/test_heartbeat_reporter.py` — the shared `_make_reporter`
+  helper now sets `phase="streaming"` when it sets
+  `ffmpeg_running=True` (matches the new production contract).
+  Added two new tests: `test_reporter_status_is_reconnecting_when_phase_set`
+  asserts the `reconnecting` mapping, and
+  `test_reporter_status_is_error_when_phase_stopping` asserts the
+  fallback to `error`.
+- `tests/test_supervisor.py` — the cleanup-ordering assertion now
+  expects ffmpeg_stopped → session_stopped → camera_released (M7
+  moved session-stop into the per-attempt cleanup so the old
+  session is released before the next attempt starts). The four
+  M5/M6 failure tests
+  (`test_frame_write_failure_cleans_up_everything`,
+  `test_camera_read_failure_stops_ffmpeg_and_session`,
+  `test_ffmpeg_exit_mid_stream_raises_ffmpeg_exit_error_and_cleans_up`,
+  `test_api_failure_does_not_start_ffmpeg`) now pass `max_attempts=1`
+  and a fast backoff so they reproduce the pre-M7 fail-fast
+  behaviour (one attempt, recoverable failures re-raise the typed
+  exception). `test_api_failure_does_not_start_ffmpeg` asserts the
+  raw `ApiAuthError` propagates — M7 dropped the M5/M6
+  `StreamingRuntimeError` wrapper so callers can branch on the
+  original class.
+- `tests/test_supervisor_heartbeat.py` — the
+  `test_missing_agent_id_skips_reporter_and_warns` test now
+  monkeypatches the supervisor's new `_register_if_needed` helper
+  (the M5/M6 `_obtain_stream_approval` is no longer imported by
+  the supervisor).
+- `docs/architecture.md` — bumped "What exists today" to
+  Milestones 1–7. New "Runtime recovery (Milestone 7)"
+  subsection with the recovery-loop diagram, the
+  recoverable-vs-fatal classification table, the phase-to-status
+  mapping, the end-to-end cleanup ordering, the Ctrl+C contract,
+  and the two hidden `run_agent` test knobs. Status table
+  refreshed: reconnect/backoff/camera-reopen/session-restart
+  moves to "done (M7)"; proactive session refresh + token
+  rotation move to "planned (M8+)".
+- `docs/module-map.md` — added `runtime/backoff.py`. Updated
+  `runtime/__init__.py`, `runtime/stats.py`,
+  `heartbeat/reporter.py`, and `supervisor.py` for the new
+  symbols and behaviour. Added `tests/test_runtime_backoff.py`
+  and `tests/test_supervisor_recovery.py` to the test table.
+  Removed the M7 entry from the deferred-submodules table.
+- `docs/troubleshooting.md` — new "Reconnect / reliability
+  (Milestone 7)" section covering camera unplug, recoverable
+  FFmpeg failures, network drops, indefinite heartbeat warnings,
+  fatal heartbeat exit, session restart between attempts, and
+  Ctrl+C during reconnect.
+- `docs/api-contracts.md` — added the M7 note up top stating no
+  new endpoints. Added a "Recoverable vs fatal (Milestone 7)"
+  subsection with the typed-error classification table.
+
+### Functions/classes changed
+- `BackoffPolicy` (new) — bounded exponential backoff with
+  jitter and interruptible sleep.
+- `RuntimePhase` (new) and `RuntimeStats.set_phase`,
+  `StatsSnapshot.phase` (new fields) — let the heartbeat
+  reporter report `RECONNECTING` while the supervisor is
+  between attempts.
+- `_phase_to_status(snapshot)` (new, private) in
+  `heartbeat/reporter.py` — maps phase + ffmpeg flag to wire
+  `HeartbeatStatus`.
+- `_run_attempt(...)` (new, private) in `supervisor.py` — one
+  streaming attempt with its own session / FFmpeg / reporter
+  lifecycle. Never raises; returns an `_AttemptOutcome` the
+  outer loop reads.
+- `_classify(exc)` (new, private) — maps an exception type to
+  fatal / recoverable_stream / recoverable_camera. The agent
+  branches on type, never on message.
+- `_register_if_needed` and `_start_session` (new, private) —
+  typed-error-propagating registration + start-session calls
+  shared across recovery attempts.
+- `_reopen_camera_with_backoff` (new, private) — closes the
+  current camera and reopens it with backoff; honors shutdown.
+- `run_agent` — added `max_attempts` and `backoff` kwargs.
+  Refactored into outer recovery loop + outer cleanup. The
+  existing `client_factory` / `camera_factory` / `ffmpeg_factory`
+  / `reporter_factory` / `ffmpeg_probe` / `save_progress` /
+  `max_frames` / `on_event` kwargs are unchanged.
+
+### System interaction notes
+The recovery loop never invents an SRT URL: every attempt calls
+`POST /v1/stream-sessions/start` to get a new session and
+`POST /v1/stream-sessions/{id}/stop` to release the previous
+one. Cleanup ordering across the lifetime of `run_agent` is
+heartbeat → FFmpeg → session (per attempt) → camera → client
+(outer), so the old session is released to the server promptly
+before the next attempt begins. The heartbeat reporter is
+per-session and torn down inside attempt cleanup, so during the
+actual reconnect gap there are no heartbeats; the dashboard
+sees one `reconnecting` heartbeat at most (the brief window
+before the reporter stops) and then the agent goes silent on
+the heartbeat channel until the next attempt's reporter starts.
+
+Ctrl+C is honored at every wait point. The backoff sleep is
+built on `threading.Event.wait`, which both raises
+`KeyboardInterrupt` for SIGINT on the main thread *and* returns
+immediately if a separate `shutdown.set()` is called. The
+`_reopen_camera_with_backoff` helper uses the same primitive.
+After Ctrl+C the per-attempt and outer cleanup both run, then
+`KeyboardInterrupt` propagates out of `run_agent` and the CLI
+exits 0.
+
+Pre-M7 callers that expected a typed exception to propagate
+from `run_agent` can opt back into the old behaviour by passing
+`max_attempts=1`. Production callers (the `upstream run` CLI)
+leave it unset for unbounded retry.
+
+### Testing/checks
+- `pytest -q` — 340 tests pass (327 from M1–M6 + 13 new in
+  `test_supervisor_recovery.py`; plus `test_runtime_backoff.py`
+  with 15 tests, two new heartbeat-status tests, one new stats
+  test, and minor updates to four existing supervisor tests).
+- `ruff check upstream_agent tests` — 5 warnings, all
+  pre-existing baseline (4 B008 typer-Option-in-default in
+  `cli.py`, 1 I001 in `tests/test_token_redaction.py`).
+- Manual smoke verification plan (with a live
+  `upstream-api-server` and MediaMTX):
+  1. `upstream run`; once streaming, unplug the webcam — confirm
+     `camera_lost` / `Waiting … before camera reopen` / `Camera
+     reopened` event sequence and that frames resume.
+  2. `upstream run`; once streaming, `kill -9` the FFmpeg PID —
+     confirm recoverable_stream classification, fresh
+     `start_stream_session` call, streaming resumes.
+  3. `upstream run`; once streaming, drop Wi-Fi for ~10 s —
+     confirm heartbeat warnings and that the stream resumes
+     after the network returns.
+  4. Ctrl+C during a backoff sleep — confirm immediate exit, no
+     traceback, no zombie FFmpeg (`pgrep ffmpeg`), no locked
+     camera (`lsof | grep video0`).
+  5. Revoke the API token mid-stream — confirm
+     `exit_reason=fatal_heartbeat`, no reconnect loop.
+  6. `grep -E 'srt://|streamid|session_token' ~/.upstream/logs/*`
+     after each scenario — must be empty.
+
+### Follow-up TODOs
+- Milestone 8: proactive session refresh based on
+  `expires_at` (today we react to failures only); token rotation
+  / refresh; reporter-side backoff for very long network
+  outages so the warning rate slows from 5 s to ~30 s after the
+  first few failures; optional "going offline" final heartbeat
+  on shutdown; frame buffering across reconnect gaps so the
+  dashboard doesn't see a hard cut.
+- Optional later: surface the attempt counter on `RunResult`
+  for downstream observability; expose `reconnect_attempts`
+  via the heartbeat schema once the server supports it.
+- Optional later: classify `camera_already_streaming` (422)
+  specially so the supervisor waits out the server-side
+  session timeout and then retries. Today it stays fatal —
+  the user has to wait and re-run.
+
+---
+
 ## 2026-05-14 - encoder: pin GOP to fps for snappy first-frame on join
 
 ### Summary

@@ -33,7 +33,7 @@ to the UpStream streaming server.
            heartbeat (status, errors, metrics) ──▶ UpStream API
 ```
 
-## What exists today (Milestones 1–6)
+## What exists today (Milestones 1–7)
 
 Milestone 1 delivered the CLI, config loader, local state, and
 logging with token redaction. Milestone 2 added the camera-source
@@ -47,6 +47,11 @@ command that actually streams video. **Milestone 6** adds the
 heartbeat loop: a background thread that POSTs runtime telemetry
 (status, fps, bitrate, resolution, last error) to
 `POST /v1/heartbeats` every 5 seconds while the stream is active.
+**Milestone 7** makes the runtime resilient: transient FFmpeg,
+SRT, network, and camera failures no longer kill the agent.
+The supervisor now runs an interruptible recovery loop with
+bounded exponential backoff, requests a fresh stream session per
+attempt, and reopens the camera if it disconnects mid-stream.
 
 | Layer | Status |
 | --- | --- |
@@ -65,8 +70,9 @@ heartbeat loop: a background thread that POSTs runtime telemetry
 | Supervisor / runtime (`run_agent`) | done (M5–M6) |
 | Live SRT streaming end-to-end against real MediaMTX | done (M5) |
 | Heartbeat loop + runtime health reporting | done (M6) |
+| Reconnect/backoff, camera reopen, session restart | done (M7) |
 | Frame buffer | **planned** |
-| Reconnect/backoff, session refresh, token rotation, config fetch | **planned (M7+)** |
+| Proactive session refresh from `expires_at`, token rotation, config fetch | **planned (M8+)** |
 | RTSP / IP camera / file sources | **planned** |
 
 ## Camera source layer
@@ -360,6 +366,167 @@ telemetry. The only sensitive value involved is the bearer token,
 which is attached by :meth:`UpstreamApiClient._build_auth_header`
 and never logged (the redaction filter scrubs it as a second
 line of defense).
+
+## Runtime recovery (Milestone 7)
+
+`upstream run` survives normal field failures by retrying the
+work that can be retried, without reusing any session token or
+SRT URL across attempts. This section is **deliberately honest**
+about what the agent can and cannot prove from inside its own
+process — the live-smoke tests showed that earlier wordings
+over-claimed visibility into the dashboard.
+
+### What the agent CAN prove (per attempt)
+
+- **Local FFmpeg startup.** The subprocess launched and is
+  consuming frames on stdin.
+- **API-reported session state.** After FFmpeg starts the
+  supervisor polls `GET /v1/stream-sessions/{session_id}` and
+  waits for `state == "streaming"`. That value flips when
+  MediaMTX's `runOnReady` webhook fires for *this specific
+  session*, which proves the streaming server accepted at
+  least the initial SRT publish + ffprobe handshake. Each new
+  `start_stream_session` call creates a new database row, so
+  the read is fresh-by-construction — no stale state from
+  prior attempts can leak in.
+- **Heartbeat acceptance.** The POST to `/v1/heartbeats`
+  returned 200.
+
+### What the agent CANNOT prove
+
+- **Ongoing dashboard playback.** Nothing on the API surface
+  lets the agent verify that a viewer is currently rendering
+  frames. The `state` field is sticky once set to
+  `"streaming"`; if the streaming server's `runOnNotReady`
+  webhook is missed (e.g. on a sudden network drop) the value
+  can lag reality. The agent will eventually see this as an
+  FFmpeg write failure or session-stop error, but there can
+  be a 5–30 s window where the agent's logs and the
+  dashboard's view disagree.
+- **MediaMTX's continued re-broadcasting.** Same story —
+  the agent has no push channel from the streaming server.
+
+Log messages are worded to reflect this: `ingest_confirmed`
+says "API reports session streaming (MediaMTX confirmed
+initial ingest). Dashboard playback is not directly
+verified." `streaming` says "Streaming started (frames
+flowing to streaming server)." Neither claims viewer-side
+playback.
+
+### Recovery loop
+
+```
+   probe FFmpeg ─── fatal if missing/SRT/H264 unavailable
+   open camera ─── fatal on initial open failure
+   open API client
+   ┌──── recovery loop ──────────────────────────────────────────┐
+   │  _run_attempt:                                              │
+   │     register (first attempt only) → start_stream_session    │
+   │       → build FFmpeg command → start FFmpeg                 │
+   │       → poll GET /v1/stream-sessions/{id} for streaming     │
+   │       → start HeartbeatReporter → frame loop                │
+   │       → ATTEMPT CLEANUP (heartbeat → ffmpeg → session)      │
+   │  on normal exit / fatal_heartbeat: break                    │
+   │  on fatal classification: re-raise                          │
+   │  on recoverable_stream: backoff.sleep, retry                │
+   │  on recoverable_camera: close camera, reopen with backoff,  │
+   │     retry                                                   │
+   └─────────────────────────────────────────────────────────────┘
+   OUTER CLEANUP (camera → API client)
+```
+
+**Backoff.** `BackoffPolicy` implements bounded exponential
+backoff with ±20 % multiplicative jitter: 1 s initial, ×2,
+capped at 30 s. Sleep is built on `threading.Event.wait` so a
+shutdown signal wakes the wait immediately.
+
+**Recoverable vs fatal classification.** `_classify` maps the
+exception type — never the message string — to one of three
+categories.
+
+| Category | Triggers | Action |
+| --- | --- | --- |
+| Fatal | `ApiTokenRevokedError`, `ApiTokenExpiredError`, `ApiAuthError`, `ApiValidationError`, `FfmpegNotFoundError`, `FfmpegSrtUnsupportedError`, `FfmpegH264UnsupportedError`, `FfmpegStartError`, `CommandBuildError`, any non-`Exception` BaseException | Run attempt cleanup, outer cleanup, re-raise |
+| Recoverable stream | `FfmpegExitError`, `FfmpegWriteError`, `ApiConnectionError`, `ApiServerError`, `ApiRateLimitError`, `ApiContractError`, `SrtUrlError`, generic `StreamingRuntimeError` | Run attempt cleanup, backoff sleep, retry with a fresh session |
+| Recoverable camera | `CameraReadError`, mid-stream `CameraOpenError` | Close camera, reopen with backoff + settle + windowed validation, then retry with a fresh session |
+
+**Camera recovery: open + settle + windowed validation.**
+`VideoCapture.open()` success alone is not proof the device is
+producing frames — V4L2 and AVFoundation will both return
+`isOpened() == True` for a dead handle. The reopen helper:
+
+1. Sleeps `_CAMERA_RECOVERY_SETTLE_S` (default **1.5 s**) after
+   `open()`.
+2. Reads frames inside a `_CAMERA_RECOVERY_VALIDATION_WINDOW_S`
+   (default **5 s**) window; recovery succeeds only when
+   `_CAMERA_RECOVERY_VALIDATION_FRAMES` (default **3**)
+   consecutive reads return frames. Transient failures inside
+   the window reset the streak but do not fail the whole
+   attempt.
+3. On window timeout, closes the camera (with a
+   `_CAMERA_RELEASE_SETTLE_S` ≈ **0.5 s** release-settle) and
+   loops. The `BackoffPolicy` is shared across reopen attempts
+   so the delay grows.
+
+**macOS / Continuity Camera limitation.** When an iPhone
+Continuity Camera leaves range, or any AVFoundation-backed
+device disappears, the kernel can keep a stale handle alive in
+the Python process. `cv2.VideoCapture(N)` still opens, but
+every read returns `(False, None)` forever. The agent does
+everything a process can do — fresh `VideoCapture` per
+attempt, explicit `CAP_AVFOUNDATION` backend on macOS, settle
+window, multi-frame validation — but **in-process recovery
+from a disappeared AVFoundation device is not reliable.** After
+`_CAMERA_UNAVAILABLE_HINT_AFTER` (default **3**) consecutive
+failed reopen cycles, the supervisor emits a single
+`camera_unavailable_hint` event suggesting the operator
+restart the agent. Recovery keeps trying after that — some
+USB cameras come back later.
+
+**Initial camera open failure stays fatal.** Only mid-stream
+camera loss triggers the reopen loop. A camera that is never
+present at startup almost always indicates a config / hardware
+problem rather than a transient field failure.
+
+**End-to-end shutdown order** is heartbeat → FFmpeg → session
+(inside the per-attempt `finally`) → camera → client (outer
+cleanup). The per-attempt cleanup stops the old session before
+the next attempt starts so the streaming server never sees two
+concurrent streamids for the same camera.
+
+**Ctrl+C semantics.** Every wait point — frame loop, ingest
+poll, inter-attempt backoff, camera-reopen backoff, camera
+settle, validation window, release settle — is interruptible.
+`KeyboardInterrupt` propagates through outer cleanup; the CLI
+exits with code 0.
+
+**Hidden test knobs on `run_agent`.**
+
+- `max_attempts: int | None = None` — default unbounded retry.
+  Tests use `max_attempts=1` to reproduce pre-M7 behavior (one
+  attempt, any failure re-raised) or small values to exercise
+  the "give up after N" path.
+- `backoff: BackoffPolicy | None = None` — tests pass a
+  zero-delay policy so recovery never sleeps on wall clock.
+- `ingest_timeout_s`, `ingest_poll_interval_s` — tunable
+  bounds for the ingest wait. Tests use tiny values; production
+  defaults to 15 s / 0.5 s.
+- `camera_settle_s`, `camera_validation_window_s`,
+  `camera_validation_frames`, `camera_read_retry_s`,
+  `camera_release_settle_s`, `camera_unavailable_hint_after` —
+  tunable bounds for the camera reopen path.
+
+### Heartbeat status mapping
+
+The heartbeat reporter is **per-session**. Each `_run_attempt`
+builds its own reporter and stops it in the attempt cleanup.
+The reporter is not kept alive across the reconnect gap; no
+heartbeats are sent while the supervisor is between attempts.
+The wire `HeartbeatStatus` is simply `streaming if
+stats.snapshot().ffmpeg_running else error` — the
+`reconnecting` literal exists in the API schema but the agent
+does not have a code path that emits it (would require a
+session-independent reporter, which is out of scope for M7).
 
 ## Design principles
 

@@ -40,6 +40,44 @@ reflect what the API team has settled on.
 > runtime telemetry. The heartbeat carries no SRT URL, streamid, or
 > session token. See the new section below for the confirmed
 > contract.
+>
+> **Milestone 7 update: no new endpoints.** The recovery loop reuses
+> the existing `POST /v1/stream-sessions/start` and
+> `POST /v1/stream-sessions/{session_id}/stop` calls. Every
+> reconnect attempt asks the API for a fresh stream session; the
+> previous session is stopped first via `stop_stream_session`. The
+> agent never reuses an SRT URL or session token across attempts.
+> The recoverable-vs-fatal HTTP-status mapping the supervisor uses
+> is documented in the "Error responses" section near the bottom.
+>
+> **Milestone 7.2 update: one existing endpoint adopted.** The
+> M7 reconnect loop trusted local FFmpeg startup as proof that
+> streaming had resumed; live smoke showed that was wrong (MediaMTX
+> may reject the SRT publish without FFmpeg knowing). The agent now
+> calls the existing `GET /v1/stream-sessions/{session_id}`
+> endpoint after FFmpeg starts and polls until the session's
+> `state` flips to `"streaming"` (the value the API sets when
+> MediaMTX's `runOnReady` webhook confirms remote ingest). No
+> new server-side endpoint was needed. See the new
+> `GET /v1/stream-sessions/{session_id}` section below.
+>
+> **Milestone 7.3 update: freshness note on the `state` field.**
+> The `state == "streaming"` signal proves only **initial** ingest
+> for the current session. Each `start_stream_session` creates a
+> new DB row, so there is no stale-state leak between attempts.
+> However, the field is *sticky once set*: if MediaMTX's
+> `runOnNotReady` webhook is missed (network drop, webhook call
+> fails, server restart), the row can remain `"streaming"` after
+> the SRT publish has died. There is no server-side TTL job that
+> resets stale `"streaming"` rows. The agent does not pretend to
+> verify ongoing dashboard playback; the `ingest_confirmed`
+> event explicitly says "Dashboard playback is not directly
+> verified." Until the streaming server / API gains a push channel
+> or a server-side staleness sweep, this is the strongest local
+> signal available. M7.3 also drops the no-longer-emitted
+> `reconnecting` heartbeat status from the agent's code paths —
+> the literal stays in the schema for forward compatibility but
+> the agent only sends `streaming` / `error`.
 
 ## Base URLs
 
@@ -300,6 +338,79 @@ a warning line on stderr but `upstream check --api` still exits 0
 and the success block prints normally. The session will eventually
 expire server-side regardless.
 
+### `GET /v1/stream-sessions/{session_id}`
+
+Read the current state of a stream session. Used by `upstream run`
+in the Milestone 7.2 reconnect loop to confirm remote ingest has
+actually started — i.e., MediaMTX accepted the SRT publish and
+fired its `runOnReady` webhook, which flips the session's `state`
+column from `"approved"` to `"streaming"` on the API side. Local
+FFmpeg startup is **not** proof of remote ingest; the agent polls
+this endpoint until the API confirms.
+
+**Request**
+
+```
+GET /v1/stream-sessions/{session_id} HTTP/1.1
+Authorization: Bearer <token>
+Accept: application/json
+```
+
+No request body. The session UUID is on the URL.
+
+**Response 200 — flat session record**
+
+The response shape is the *flat* session object — not the nested
+`{ "session": {...}, "srt_url": "...", "session_token": "..." }`
+shape returned by `POST /v1/stream-sessions/start`. The agent
+parses it via `upstream_agent.api.schemas.Session`.
+
+```json
+{
+  "id": "0b91a1a8-7d3d-4c91-9c6e-ce5b9f0e6e3e",
+  "account_id": "00000000-0000-0000-0000-000000000001",
+  "agent_id": "...",
+  "camera_id": "...",
+  "state": "streaming",
+  "srt_url": "srt://ingest.upstreamcv.com:18890?streamid=publish:sess_<hex>&latency=200",
+  "streamid": "publish:sess_<hex>",
+  "expires_at": "2026-05-14T13:00:00Z",
+  "created_at": "2026-05-14T12:00:00Z",
+  "started_at": "2026-05-14T12:00:01Z",
+  "ended_at": null,
+  "requested": { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" },
+  "approved":  { "width": 1280, "height": 720, "fps": 30, "codec": "h264", "bitrate_kbps": 3000, "latency_mode": "balanced" }
+}
+```
+
+**State values**
+
+| `state` | Meaning |
+| --- | --- |
+| `approved` | Session created; awaiting MediaMTX ingest confirmation. |
+| `streaming` | Remote ingest confirmed. **This is the value the agent waits for.** |
+| `ended` | Session stopped (terminal — agent treats as recoverable; will request a new session). |
+| `expired` | Session TTL exceeded (terminal — recoverable). |
+| `failed` | Validation failure (terminal — recoverable). |
+
+**Error responses**
+
+Uses the same envelope and status-code mapping documented in
+"Error envelope" below.
+
+- `404` → `ApiValidationError` (fatal — agent stops).
+- `401` with `code="token_revoked"` / `code="token_expired"` → typed
+  fatal error.
+- `5xx` / `429` / connection failure → recoverable; the agent's
+  ingest poll catches these and keeps polling within the overall
+  timeout.
+
+**Sensitive-data discipline.** The response body still contains
+`srt_url` and `streamid` — the agent reads only `state` and
+discards the rest. The SRT URL and streamid never appear on
+`Session` outside the orchestrator scope, never in logs, and never
+in heartbeat payloads.
+
 ### `POST /v1/heartbeats`
 
 Submit a batch of heartbeats for an agent. Called by `upstream run`
@@ -454,6 +565,34 @@ support.
 - `limit_exceeded.resolution_too_high`
 - `limit_exceeded.bitrate_too_high`
 - `limit_exceeded.codec_not_allowed`
+
+### Recoverable vs fatal (Milestone 7)
+
+The supervisor's recovery loop classifies typed `ApiError`
+subclasses to decide whether to retry the work or stop. The
+mapping is purely by class — the agent never inspects message
+strings.
+
+| Typed error | Classification | Why |
+| --- | --- | --- |
+| `ApiConnectionError` | Recoverable | Transport blip — DNS, refused, timeout. |
+| `ApiServerError` (5xx) | Recoverable | Server-side transient. |
+| `ApiRateLimitError` (429) | Recoverable | Backoff handled by the supervisor, not by reading `Retry-After`. |
+| `ApiContractError` | Recoverable | Often a server-side intermittent (partial JSON, transient gateway response). |
+| `ApiTokenRevokedError` | Fatal | Requires human action — agent stops cleanly. |
+| `ApiTokenExpiredError` | Fatal | Same — `exit_reason=fatal_heartbeat` from the heartbeat side-channel. |
+| `ApiAuthError` (401/403 other) | Fatal | Credential / permission issue. |
+| `ApiValidationError` (400/409/422/404) | Fatal | Bad request shape or unknown resource — retrying won't help. |
+
+`camera_already_streaming` shows up as `ApiValidationError`
+(422) and is classified as **fatal** — the supervisor stops
+cleanly rather than retrying. The supervisor's normal
+recovery path always stops the previous session before
+requesting a new one, so this code only surfaces if the
+previous `stop_stream_session` call also failed *and* the
+server-side session hasn't timed out yet. If you hit this in
+the field, wait for the server-side stream-session timeout
+(typically tens of seconds) and re-run.
 
 ## Sensitive-data rules
 

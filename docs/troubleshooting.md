@@ -548,11 +548,226 @@ window may simply not have refreshed yet, or its threshold for
 
 Defensive log line emitted when `state.agent_id` is `None` at the
 point the supervisor is about to start the heartbeat thread. In
-normal operation `_obtain_stream_approval` sets `agent_id` during
-registration; if you see this, your local
+normal operation the supervisor's `_register_if_needed` helper
+sets `agent_id` during registration; if you see this, your local
 `~/.upstream/agent_state.json` may have been deleted between
 registration and the streaming phase. Delete the state file
 entirely and re-run — the agent will register fresh.
+
+## Reconnect / reliability (Milestone 7)
+
+The supervisor recovers from transient failures automatically.
+The agent never invents an SRT URL — every retry asks the API
+for a fresh stream session, and the previous session's `streamid`
+is stopped before the next one is requested.
+
+### Camera unplug / reconnect
+
+Pull the USB cable mid-stream (or `lsof | grep video0` and force
+the device away). The agent emits, in order:
+
+```
+Recoverable failure; cleanup complete, will retry. CameraReadError: ...
+Camera disconnected
+Waiting 1.0s before camera reopen attempt #1
+Reopening camera (attempt #1)
+Camera reopen attempt #1 failed (open): CameraOpenError: ...
+Waiting 2.0s before camera reopen attempt #2
+Reopening camera (attempt #2)
+Camera opened; waiting 1.5s for device to settle
+Camera validation read failed (attempt #2, read #1): ... retrying within window
+Camera validation timed out after 5.0s (attempt #2, 0/3 good, ...); will retry reopen
+... (more attempts; backoff grows; the helper does not reset between cycles)
+Camera opened; waiting 1.5s for device to settle
+Camera recovery validated after 3 good frame(s)
+API session approved
+FFmpeg started
+FFmpeg started; waiting for API to report session streaming
+API reports session streaming (MediaMTX confirmed initial ingest). Dashboard playback is not directly verified.
+Heartbeat reporting started
+Streaming started (frames flowing to streaming server).
+```
+
+**Camera recovery has three gates:** open + settle + windowed
+validation.
+
+1. **Open** — `VideoCapture.open()` must succeed. Open failures
+   surface as `Camera reopen attempt #N failed (open): ...`.
+2. **Settle** — `_CAMERA_RECOVERY_SETTLE_S` (default **1.5 s**)
+   after open. Some USB / Continuity / V4L2 cameras need this
+   to start producing frames.
+3. **Windowed validation** — collect
+   `_CAMERA_RECOVERY_VALIDATION_FRAMES` (default **3**)
+   consecutive successful reads inside
+   `_CAMERA_RECOVERY_VALIDATION_WINDOW_S` (default **5 s**).
+   Failed reads inside the window reset the streak but are
+   logged as `camera_validation_read_failed` rather than
+   failing the whole attempt. Window timeout surfaces as
+   `camera_validation_timeout`.
+
+Only after all three gates pass does the supervisor proceed
+(`camera_validated`). Backoff is shared across reopen attempts
+and **does not reset** between cycles. Every wait point is
+interruptible by Ctrl+C.
+
+### `camera_unavailable_hint` — macOS Continuity Camera limitation
+
+After three consecutive failed reopen cycles, the supervisor
+emits a single `camera_unavailable_hint` event:
+
+```
+camera_unavailable_hint: Camera device has opened but failed to
+produce frames for 3 consecutive recovery cycles. On macOS /
+Continuity Camera this often requires restarting the agent. The
+agent will keep retrying.
+```
+
+**Why.** macOS / AVFoundation caches device handles per process.
+When an iPhone Continuity Camera leaves range, or any
+AVFoundation-backed device disappears, `cv2.VideoCapture(N)`
+inside the running Python process can still report
+`isOpened() == True`, but every `read()` returns `(False, None)`
+forever. The agent already builds a fresh `WebcamSource` and
+fresh `cv2.VideoCapture` (with explicit `CAP_AVFOUNDATION` on
+macOS) per attempt — there is nothing left to flush from
+inside the process. **The honest fix is `Ctrl+C` and re-run.**
+
+The agent does keep retrying after the hint — some USB cameras
+come back later — so if you can replug a real USB webcam, you
+do not need to restart the agent.
+
+### Remote ingest confirmation (`waiting_for_ingest`)
+
+After FFmpeg starts, the agent polls
+`GET /v1/stream-sessions/{id}` and waits for `state ==
+"streaming"`. The event sequence:
+
+```
+FFmpeg started
+FFmpeg started; waiting for API to report session streaming
+... (the agent pumps frames into FFmpeg while polling every 0.5 s)
+API reports session streaming (MediaMTX confirmed initial ingest).
+Dashboard playback is not directly verified.
+Heartbeat reporting started
+Streaming started (frames flowing to streaming server).
+```
+
+Timeout is `_INGEST_CONFIRM_TIMEOUT_S` (default **15 s**); poll
+cadence is `_INGEST_POLL_INTERVAL_S` (default **0.5 s**). The
+polling helper writes frames into FFmpeg while it waits because
+MediaMTX needs an active SRT publish before its `runOnReady`
+webhook fires.
+
+If the wait times out, the supervisor classifies it as a
+recoverable stream failure (`remote_ingest_timeout`), tears the
+attempt down, and asks for a fresh session. A persistent
+timeout typically means MediaMTX is rejecting the SRT publish;
+check the streaming server's logs for the failing `streamid`.
+
+### Why dashboard playback may not match agent logs
+
+The agent's strongest local signal is "API reports session
+streaming," which fires when MediaMTX accepts the *initial* SRT
+publish (its `runOnReady` webhook posts to the API). After
+that, **the agent has no continuous remote-playback signal:**
+
+- The API's `state` field is sticky. If the streaming server's
+  `runOnNotReady` webhook is missed (sudden network drop,
+  webhook call itself fails, MediaMTX restart), the state can
+  remain `"streaming"` even though the SRT publish is dead.
+  The dashboard reads the same field, so it sees the same
+  staleness.
+- The agent eventually notices via an FFmpeg write/exit error,
+  which can take 5–30 s depending on the kernel's SRT-socket
+  timeout. Until then, agent logs and dashboard state will
+  disagree with reality.
+- No API surface today lets the agent verify continuous remote
+  playback. The supervisor's job is to (1) start cleanly, (2)
+  confirm initial ingest, (3) detect failures reactively and
+  retry. The dashboard is a separate trust boundary.
+
+In short: an "API reports session streaming" log line proves
+initial MediaMTX ingest, not ongoing dashboard visibility.
+That's the most the local process can know.
+
+### `Recoverable recoverable_stream during streaming attempt: FfmpegExitError`
+
+FFmpeg exited unexpectedly while frames were flowing — usually
+the streaming server dropped the SRT connection or the local
+FFmpeg ran into a transcode error. The supervisor stops the old
+session, requests a new one, and restarts FFmpeg. If the same
+failure keeps firing (visible in the logs as repeated
+`recoverable_stream` lines), check the streaming server's logs
+for the matching `streamid` rejection reason — the agent can't
+diagnose server-side rules.
+
+### `Recoverable recoverable_stream during streaming attempt: FfmpegWriteError`
+
+The local stdin pipe to FFmpeg broke — almost always because
+FFmpeg itself exited a moment before the write. Same recovery
+path as the exit case above; the supervisor scrubs the snippet
+of FFmpeg stderr included in the message, so no SRT URL ever
+appears in the event or log.
+
+### Network drop mid-stream
+
+A short Wi-Fi blip surfaces as transient warnings from the
+heartbeat thread (`Heartbeat send failed (transient): ...`) and
+eventually as a `FfmpegExitError` once FFmpeg's SRT socket
+times out. The recovery loop backs off and retries. The
+heartbeat thread doesn't have its own backoff — repeated
+transient failures just keep logging warnings every 5 s. If the
+network is down for hours the agent keeps retrying forever; hit
+Ctrl+C to stop.
+
+### `Heartbeat send failed (transient): ...` repeats indefinitely
+
+The heartbeat reporter is intentionally noisy on transient
+failures. M7 did not add backoff to the reporter — it stays
+loud so operators can see the issue. If FFmpeg is still
+healthy, the stream itself is unaffected; the dashboard simply
+goes offline until the heartbeat path recovers. If you see
+this for hours, check the API server / DNS, then restart the
+agent.
+
+### `Heartbeat reported fatal error: ApiTokenRevokedError`
+
+The API revoked the agent's token mid-stream. The recovery
+loop **does not** retry — the agent stops cleanly with
+`exit_reason=fatal_heartbeat`. Rotate the token in
+`~/.upstream/config.yaml` and re-run.
+
+### Session restart between attempts
+
+Each recovery attempt requests a brand-new stream session. The
+agent caches `agent_id` and `last_camera_id` in
+`~/.upstream/agent_state.json` so it only registers once;
+subsequent attempts call `POST /v1/stream-sessions/start`
+directly. The previous attempt's `session_id` is stopped via
+`POST /v1/stream-sessions/{id}/stop` before the new one is
+requested. If the stop call fails, you'll see a
+`session_stop_warning` event; the next start attempt may then
+hit `camera_already_streaming` (422) which the supervisor
+classifies as fatal (validation errors don't retry — see
+`docs/api-contracts.md`). Wait out the server-side session
+timeout and re-run.
+
+### Ctrl+C during reconnect / backoff sleep
+
+Ctrl+C is interrupt-able at every wait point:
+
+- During the frame loop: the in-flight syscall is interrupted,
+  attempt cleanup runs, outer cleanup runs, `KeyboardInterrupt`
+  propagates to the CLI which exits 0.
+- During the inter-attempt backoff sleep: `BackoffPolicy.sleep`
+  uses `threading.Event.wait` which raises `KeyboardInterrupt`
+  in the main thread. Same cleanup chain.
+- During the camera reopen backoff: identical path.
+
+You should never see the agent hang in a 30 s sleep after
+Ctrl+C. If you do, capture a stack trace
+(`py-spy dump --pid <pid>`) and file an issue — that would be
+a bug.
 
 ## Installation
 

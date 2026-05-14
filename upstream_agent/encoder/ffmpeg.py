@@ -198,6 +198,36 @@ class FfmpegEncoderProcess:
     def redacted_command(self) -> list[str]:
         return list(self._redacted_command)
 
+    def read_stderr_snippet(self) -> str:
+        """Return a short, leak-free snippet of FFmpeg's captured stderr.
+
+        Safe to call after the subprocess has exited — the
+        ``stderr=subprocess.PIPE`` capture means the kernel has
+        already drained the FFmpeg output into the pipe buffer and
+        :meth:`io.RawIOBase.read` returns whatever was written before
+        exit. SRT URLs are scrubbed before the snippet is returned;
+        the result is capped at :data:`_STDERR_SNIPPET_LIMIT` chars.
+
+        Empty string if the process has no captured stderr, or the
+        read fails. Never raises.
+        """
+
+        proc = self._proc
+        if proc is None:
+            return ""
+        stderr_stream = getattr(proc, "stderr", None)
+        if stderr_stream is None:
+            return ""
+        try:
+            raw = stderr_stream.read()
+        except OSError:
+            return ""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if not isinstance(raw, str):
+            return ""
+        return _scrub_stderr(raw)
+
     def __repr__(self) -> str:
         return f"FfmpegEncoderProcess(redacted_command={self._redacted_command!r})"
 

@@ -274,35 +274,36 @@ def test_fatal_heartbeat_exits_loop_with_correct_reason() -> None:
 def test_missing_agent_id_skips_reporter_and_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """If `_obtain_stream_approval` somehow returns without setting
+    """If `_register_if_needed` somehow returns without setting
     state.agent_id, the supervisor must log a warning and run without
     a reporter — never crash the stream."""
 
     caplog.set_level(logging.WARNING)
     kit = _make_factory_kit()
 
-    # Patch the API helper so it does NOT update state.agent_id while
-    # still returning a valid session response. Simpler: monkeypatch
-    # the FakeApiClient.register_agent to return an Agent with no id?
-    # No — the existing diagnostics flow always sets agent_id when the
-    # FakeApiClient returns id="agent_1". To force the skip path,
-    # patch the supervisor's `_obtain_stream_approval` call indirectly
-    # by giving the FakeApiClient a None state via a custom factory.
-    # The cleanest way: override `_obtain_stream_approval` directly.
+    # Patch the supervisor's registration helper to strip agent_id off
+    # the working state after registration completes. This drives the
+    # ``agent_id is None`` branch deterministically without faking the
+    # API client's responses.
     from upstream_agent import supervisor as supervisor_module
 
-    real = supervisor_module._obtain_stream_approval
+    real = supervisor_module._register_if_needed
 
-    def patched(cfg, state, client, capabilities, save_progress):
-        outcome, new_state = real(cfg, state, client, capabilities, save_progress)
-        # Strip agent_id from the working state before returning.
+    def patched(*, cfg, state, client, capabilities, save_progress):
+        new_state = real(
+            cfg=cfg,
+            state=state,
+            client=client,
+            capabilities=capabilities,
+            save_progress=save_progress,
+        )
         if new_state is not None:
             new_state = new_state.model_copy(update={"agent_id": None})
-        return outcome, new_state
+        return new_state
 
     monkeypatch = pytest.MonkeyPatch()
     try:
-        monkeypatch.setattr(supervisor_module, "_obtain_stream_approval", patched)
+        monkeypatch.setattr(supervisor_module, "_register_if_needed", patched)
         result, _ = run_agent(
             _cfg(), _state_with_agent(agent_id=None),
             camera_factory=kit["camera_factory"],

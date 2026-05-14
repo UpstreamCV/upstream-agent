@@ -326,3 +326,40 @@ def test_redacted_command_property_returns_copy() -> None:
     snapshot = proc.redacted_command
     snapshot.append("MUTATION")
     assert proc.redacted_command == redacted  # Unchanged.
+
+
+# ---------------------------------------------------------------------------
+# read_stderr_snippet
+# ---------------------------------------------------------------------------
+
+
+def test_read_stderr_snippet_returns_empty_before_start() -> None:
+    proc = FfmpegEncoderProcess(_happy_cmd(), _redacted_cmd())
+    assert proc.read_stderr_snippet() == ""
+
+
+def test_read_stderr_snippet_scrubs_srt_url_and_caps_length() -> None:
+    stderr_text = (
+        "frame= 1\n"
+        f"[srt @ 0x1] connecting to {_PLACEHOLDER_SRT_URL}\n"
+        "Input/output error\n"
+    )
+    fake = FakeProc(stderr_text=stderr_text)
+    proc = FfmpegEncoderProcess(
+        _happy_cmd(), _redacted_cmd(), popen_factory=lambda c: fake
+    )
+    proc.start()
+    snippet = proc.read_stderr_snippet()
+    assert "srt://" not in snippet
+    assert _PLACEHOLDER_SRT_URL not in snippet
+    # The non-SRT lines are preserved.
+    assert "Input/output error" in snippet
+
+
+def test_read_stderr_snippet_handles_missing_stderr_pipe() -> None:
+    fake = FakeProc(stderr_text="")  # No stderr captured.
+    proc = FfmpegEncoderProcess(
+        _happy_cmd(), _redacted_cmd(), popen_factory=lambda c: fake
+    )
+    proc.start()
+    assert proc.read_stderr_snippet() == ""
