@@ -7,12 +7,6 @@ failure, mid-stream FFmpeg exit, camera read failure, Ctrl+C) stops
 the FFmpeg subprocess, releases the camera, and stops the API
 session, in that order.
 
-This is the *Milestone 5 prep* runtime. Real end-to-end smoke against
-MediaMTX is still gated on the API server returning an SRT URL whose
-host/port reaches the running MediaMTX. To unblock local testing in
-the meantime, the supervisor honours an env-only dev override
-(:data:`OVERRIDE_ENV_NAME`); see ``docs/troubleshooting.md``.
-
 Sensitive-data discipline:
 
 * The raw SRT URL stays in a single local variable inside
@@ -22,13 +16,11 @@ Sensitive-data discipline:
   straight into :class:`FfmpegEncoderProcess`, alongside a redacted
   copy that is the only argv the wrapper exposes via ``__repr__``
   or error messages.
-* The dev override warning is a fixed string that contains no URL.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -49,19 +41,8 @@ from upstream_agent.errors import (
 )
 from upstream_agent.sources.base import VideoSource
 from upstream_agent.sources.webcam import WebcamSource
-from upstream_agent.transport.srt import parse_srt_url
 
 logger = logging.getLogger(__name__)
-
-
-# Dev override: see docs/troubleshooting.md. Temporary; will be
-# removed once `upstream-api-server` returns a correct local/dev
-# ingest host/port.
-OVERRIDE_ENV_NAME: str = "UPSTREAM_DEV_SRT_URL_OVERRIDE"
-_OVERRIDE_WARNING: str = (
-    "UPSTREAM_DEV_SRT_URL_OVERRIDE is set; substituting dev SRT URL for the "
-    "API-issued URL. The real API session is still started and stopped."
-)
 
 
 ExitReason = Literal[
@@ -189,26 +170,6 @@ def _frame_to_bytes(frame: Any) -> bytes:
     )
 
 
-def _apply_dev_override(api_srt_url: str | None) -> str | None:
-    """Honour ``UPSTREAM_DEV_SRT_URL_OVERRIDE``; return the URL to use.
-
-    If the override is unset/empty, returns ``api_srt_url`` unchanged.
-    If the override is set, validates it via :func:`parse_srt_url`
-    (which raises :class:`SrtUrlError` cleanly on a bad value, never
-    echoing the URL), logs the fixed warning, and returns the
-    override.
-    """
-
-    override = os.environ.get(OVERRIDE_ENV_NAME, "")
-    if not override:
-        return api_srt_url
-    # Validates scheme/host/port; raises SrtUrlError on bad input. The
-    # exception message is generic and contains no URL value.
-    parse_srt_url(override)
-    logger.warning(_OVERRIDE_WARNING)
-    return override
-
-
 def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
     cfg: Config,
     state: Any,
@@ -306,7 +267,7 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
         api_srt_url: str | None = (
             session_resp.srt_url or session_resp.session.srt_url
         )
-        srt_url = _apply_dev_override(api_srt_url)
+        srt_url = api_srt_url
         if not srt_url:
             from upstream_agent.errors import StreamingRuntimeError  # noqa: PLC0415
 

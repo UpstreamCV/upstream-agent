@@ -476,33 +476,15 @@ The server-side session will expire on its own.
 
 ### `upstream run` ends immediately with "Stream session stopped" and no `Streaming started`
 
-Almost certainly the SRT URL the backend returned points at a host
-or port the agent cannot reach — the underlying SRT push fails
-before any frame is written, and FFmpeg exits quickly. See the
-"M5-prep dev override" entry below for a workaround while the API
-ingest host/port issue is being fixed.
-
-### M5-prep dev override (temporary)
-
-While `upstream-api-server` is being updated to return an SRT URL
-whose host/port reaches a running MediaMTX, the agent honours a
-temporary env-only override:
-
-```
-UPSTREAM_DEV_SRT_URL_OVERRIDE="srt://<your-mediamtx-host>:8890/?streamid=publish:<channel>" upstream run
-```
-
-When this env var is set:
-
-- The agent still creates a real API session via
-  `start_stream_session` and stops it on shutdown.
-- The URL the API returned is **replaced** with the override before
-  the FFmpeg command is built.
-- A single fixed warning line is logged. The line contains no URL.
-
-This override is **temporary**. It will be removed once the API
-returns a correct local/dev ingest host/port. Do not document this
-in user-facing materials and do not rely on it in production.
+The SRT URL returned by `/v1/stream-sessions/start` points at a
+host or port the agent cannot reach — the underlying SRT push
+fails before any frame is written, and FFmpeg exits quickly. Check
+that the streaming server is reachable from this machine and that
+`upstream-api-server` is configured with the correct ingest
+host/port for this environment. The agent now uses only the
+API-issued SRT URL; the previous temporary local-dev SRT URL
+override was removed after real API-issued streaming was verified
+end-to-end.
 
 ## Installation
 

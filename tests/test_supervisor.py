@@ -41,11 +41,10 @@ from upstream_agent.errors import (
     FfmpegExitError,
     FfmpegStartError,
     FfmpegWriteError,
-    SrtUrlError,
     StreamingRuntimeError,
 )
 from upstream_agent.sources.base import FrameInfo, VideoSource
-from upstream_agent.supervisor import OVERRIDE_ENV_NAME, RunResult, run_agent
+from upstream_agent.supervisor import RunResult, run_agent
 
 # Placeholder values — must not appear in any log/event/result.
 SECRET_SRT_URL = "srt://stream.test.local:8890/?streamid=RUN_TEST_SECRET"
@@ -53,8 +52,6 @@ SECRET_SESSION_TOKEN = "eyJhbGciOiJIUzI1NiI.RUN_TEST_JWT.signature"
 SECRET_STREAMID = "RUN_TEST_SECRET"
 SECRET_API_TOKEN = "ups_test_real_token_must_not_leak"
 DEVICE_ID = "device-uuid-abcdefgh-1111-2222-3333-444444444444"
-
-DEV_OVERRIDE_URL = "srt://dev.test.local:8890/?streamid=DEV_OVERRIDE_PLACEHOLDER"
 
 
 # ---------------------------------------------------------------------------
@@ -705,15 +702,12 @@ def test_result_object_has_no_secrets() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dev override
+# API-issued URL behaviour
 # ---------------------------------------------------------------------------
 
 
-def test_dev_override_substitutes_url_into_ffmpeg_command(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    monkeypatch.setenv(OVERRIDE_ENV_NAME, DEV_OVERRIDE_URL)
-    caplog.set_level(logging.WARNING)
+def test_api_issued_srt_url_is_used_in_ffmpeg_command() -> None:
+    """The API-issued SRT URL is passed straight into the FFmpeg command."""
 
     factories = _make_factories()
     run_agent(
@@ -725,43 +719,4 @@ def test_dev_override_substitutes_url_into_ffmpeg_command(
         max_frames=1,
     )
     ffmpeg: FakeFfmpeg = factories["ffmpeg_holder"][0]
-    # Dev URL ended up in the FFmpeg command, API URL did not.
-    assert DEV_OVERRIDE_URL in ffmpeg.command
-    assert SECRET_SRT_URL not in ffmpeg.command
-
-    # API session was still created and stopped — the override only
-    # substitutes the URL handed to FFmpeg.
-    client: FakeApiClient = factories["client"]
-    assert client.start_session_calls
-    assert client.stop_session_calls == ["sess_99"]
-
-    # A warning was logged and contains no URL substring.
-    warning_records = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING
-        and "UPSTREAM_DEV_SRT_URL_OVERRIDE" in r.getMessage()
-    ]
-    assert warning_records, "expected dev override warning"
-    for record in warning_records:
-        msg = record.getMessage()
-        assert "srt://" not in msg
-
-
-def test_dev_override_with_invalid_url_raises_clean_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(OVERRIDE_ENV_NAME, "rtsp://bad-scheme:1234/")
-
-    factories = _make_factories()
-    with pytest.raises(SrtUrlError):
-        run_agent(
-            _cfg(), _state(),
-            camera_factory=factories["camera_factory"],
-            client_factory=factories["client_factory"],
-            ffmpeg_factory=factories["ffmpeg_factory"],
-            ffmpeg_probe=_happy_probe(),
-            max_frames=1,
-        )
-    # Cleanup still ran: camera released, session stopped.
-    assert factories["cam"].close_calls == 1
-    assert factories["client"].stop_session_calls == ["sess_99"]
+    assert SECRET_SRT_URL in ffmpeg.command

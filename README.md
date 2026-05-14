@@ -10,11 +10,8 @@ a webcam (open, read one frame, report resolution and FPS, release),
 probe the API (register the agent, register the camera, request
 a stream session), run a streaming preflight (verify FFmpeg, SRT
 support, H264, build the FFmpeg command Milestone 5 will execute),
-and run the live streaming loop end-to-end (`upstream run`).
-Milestone 5 is in **preview**: the runtime works under mocks/fakes
-and against a hand-pointed MediaMTX via a temporary dev override,
-but the real backend smoke is still gated on `upstream-api-server`
-returning an SRT URL whose host/port reaches MediaMTX.
+and run the live streaming loop end-to-end (`upstream run`) using
+the SRT URL returned by `/v1/stream-sessions/start`.
 
 ## Requirements
 
@@ -355,12 +352,10 @@ The agent stores everything under `~/.upstream/`:
   stream session), `upstream check --api`.
 - **Milestone 4: streaming preflight.** FFmpeg probe, SRT URL parser,
   FFmpeg command builder, `upstream check --streaming`.
-- **Milestone 5 (preview, current): live streaming runtime.**
+- **Milestone 5 (current): live streaming runtime.**
   `FfmpegEncoderProcess`, supervisor (`upstream_agent/supervisor.py`),
-  and `upstream run`. Pipes BGR webcam frames through FFmpeg to SRT.
-  Full real-backend smoke is blocked until the API returns an SRT
-  URL whose host/port reaches a running MediaMTX — see
-  `docs/troubleshooting.md` for the dev override.
+  and `upstream run`. Pipes BGR webcam frames through FFmpeg to SRT
+  using the SRT URL returned by `/v1/stream-sessions/start`.
 - Milestone 6+: heartbeat, reconnect/backoff, token rotation,
   additional source types and diagnostics.
 

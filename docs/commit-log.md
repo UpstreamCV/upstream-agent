@@ -32,32 +32,37 @@ Explain how this change affects the agent flow.
 
 ---
 
+## Milestone 5 cleanup — removed temporary SRT URL override
+
+After real API-issued SRT streaming was verified end-to-end, the temporary `UPSTREAM_DEV_SRT_URL_OVERRIDE` path was removed. `upstream run` now uses only the SRT URL returned by the API stream session response.
+
+---
+
 ## 2026-05-13 - feat: `upstream run` live streaming runtime (Milestone 5 prep)
 
 ### Summary
 Milestone 5 prep adds the runtime that ties everything together: `FfmpegEncoderProcess` (a managed `subprocess.Popen` wrapper around ffmpeg), the supervisor (`upstream_agent/supervisor.py`, with `run_agent()`), and `upstream run` — the first command that actually streams video. The runtime chains FFmpeg probe → camera open → API session approval → FFmpeg command build → FFmpeg start → frame loop → cleanup. Every cleanup path (normal completion, `max_frames` hit, FFmpeg start failure, mid-stream FFmpeg exit, camera read failure, API failure, `KeyboardInterrupt`) tears down FFmpeg → camera → API session in that fixed order.
 
-This is **prep**, not full M5: the real end-to-end smoke against MediaMTX is gated on `upstream-api-server` returning an SRT URL whose host/port reaches the running MediaMTX. The runtime is otherwise complete and the mocked tests exercise every cleanup path. A temporary env-only override `UPSTREAM_DEV_SRT_URL_OVERRIDE` unblocks local-dev testing while the API ingest host/port is being fixed; the override will be removed once the API returns a correct value.
+This is **prep**, not full M5: the real end-to-end smoke against MediaMTX is gated on `upstream-api-server` returning an SRT URL whose host/port reaches the running MediaMTX. The runtime is otherwise complete and the mocked tests exercise every cleanup path.
 
 ### Files touched
 - `upstream_agent/errors.py` - added `StreamingRuntimeError` (umbrella), `FfmpegRuntimeError`, `FfmpegStartError`, `FfmpegWriteError`, `FfmpegExitError`. All inherit from `UpstreamError` so the top-level CLI catch keeps working.
 - `upstream_agent/encoder/ffmpeg.py` (new) - `FfmpegEncoderProcess(command, redacted_command=None, *, popen_factory=None)`. Wraps `subprocess.Popen` with `shell=False`, `stdin=PIPE`, `stdout=DEVNULL`, `stderr=PIPE`. Public methods: `start()` (idempotent guard; raises `FfmpegStartError` on `FileNotFoundError`/`OSError`), `write_frame(bytes)` (raises `FfmpegWriteError` on `BrokenPipeError`/`OSError` — error messages scrub any `srt://` line out of FFmpeg's own stderr), `poll() -> int | None`, `stop(timeout_seconds=5.0)` (close stdin → terminate → wait → kill on timeout; never raises; idempotent). `__repr__` returns only the redacted argv. The `popen_factory` kwarg lets tests drive a fake `Popen` without any real subprocess.
 - `upstream_agent/encoder/__init__.py` - re-exports `FfmpegEncoderProcess`.
-- `upstream_agent/supervisor.py` (new) - `RunResult` dataclass and `run_agent(cfg, state, *, client_factory=None, camera_factory=None, ffmpeg_factory=None, ffmpeg_probe=None, save_progress=None, max_frames=None, on_event=None)`. Reuses `probe_ffmpeg`, `_obtain_stream_approval` from `diagnostics/api.py`, `build_ffmpeg_command` / `redact_command`, `parse_srt_url`, `WebcamSource`, and the existing `State` / `save_state` flow. The raw SRT URL lives in a single local variable inside this function and is dropped before returning — only safe booleans/IDs cross out. `on_event(stage, message)` is the CLI's hook for printing progress lines. `max_frames` lets tests run a deterministic short loop. Reads `UPSTREAM_DEV_SRT_URL_OVERRIDE` once, after API approval, and substitutes the override URL (validated via `parse_srt_url`) into the FFmpeg command if set.
+- `upstream_agent/supervisor.py` (new) - `RunResult` dataclass and `run_agent(cfg, state, *, client_factory=None, camera_factory=None, ffmpeg_factory=None, ffmpeg_probe=None, save_progress=None, max_frames=None, on_event=None)`. Reuses `probe_ffmpeg`, `_obtain_stream_approval` from `diagnostics/api.py`, `build_ffmpeg_command` / `redact_command`, `parse_srt_url`, `WebcamSource`, and the existing `State` / `save_state` flow. The raw SRT URL lives in a single local variable inside this function and is dropped before returning — only safe booleans/IDs cross out. `on_event(stage, message)` is the CLI's hook for printing progress lines. `max_frames` lets tests run a deterministic short loop.
 - `upstream_agent/cli.py` - added `@app.command("run")`, wired through to `run_agent` with a `save_progress` callback and an `on_event` lambda that forwards to `typer.echo`. Catches `KeyboardInterrupt` (exit 0 — clean shutdown) and `UpstreamError` (exit 1). Updated the module docstring to mention `upstream run`.
 - `tests/test_encoder_ffmpeg.py` (new) - 21 tests against an injected fake `Popen`. Real ffmpeg is never invoked. Covers start/idempotency/`FileNotFoundError`/`OSError`, write happy path / `BrokenPipeError` / stderr scrub / other `OSError`, `poll` proxying, `is_running` after exit, stop ordering, kill-after-timeout, stop-before-start no-op, stop idempotency, stop-never-raises, `__repr__` redaction, and `redacted_command` property defensive copy.
-- `tests/test_supervisor.py` (new) - 17 tests against `FakeCamera`/`FakeApiClient`/`FakeFfmpeg`. Covers happy path with `max_frames`, cleanup ordering (FFmpeg → camera → session), capabilities reflecting the probe, `save_progress` called twice, session-started-before-FFmpeg ordering, server-approved-config overriding local-config, FFmpeg start failure with full cleanup, frame write failure with cleanup, camera read failure stopping FFmpeg and session, FFmpeg exit mid-stream raising `FfmpegExitError`, API failure short-circuiting before FFmpeg, `KeyboardInterrupt` cleanup-then-reraise, frame resize via injected fake cv2, no-resize fast path, leak guards on events / `caplog` / result, and the `UPSTREAM_DEV_SRT_URL_OVERRIDE` dev override (substitutes URL, keeps real API session, invalid override raises cleanly).
+- `tests/test_supervisor.py` (new) - tests against `FakeCamera`/`FakeApiClient`/`FakeFfmpeg`. Covers happy path with `max_frames`, cleanup ordering (FFmpeg → camera → session), capabilities reflecting the probe, `save_progress` called twice, session-started-before-FFmpeg ordering, server-approved-config overriding local-config, FFmpeg start failure with full cleanup, frame write failure with cleanup, camera read failure stopping FFmpeg and session, FFmpeg exit mid-stream raising `FfmpegExitError`, API failure short-circuiting before FFmpeg, `KeyboardInterrupt` cleanup-then-reraise, frame resize via injected fake cv2, no-resize fast path, and leak guards on events / `caplog` / result.
 - `tests/test_cli.py` - 8 new tests for `upstream run`: help message, no-config, placeholder-token, happy path with mocked supervisor, `KeyboardInterrupt` shutdown (exit 0), FFmpeg start failure (exit 1, clean error), API failure (exit 1), and a leak guard.
 - `README.md` - added "Streaming video (preview)" section with the safe output block, flag for the M5-prep blocker, and a quick-start step `upstream run`. Updated the status section: M4 done, M5 in preview, M6+ deferred.
 - `docs/architecture.md` - status table refreshed (M5-prep done; live SRT smoke gated on API fix). New "Runtime layer (Milestone 5 prep)" subsection documenting the supervisor flow, reuse of M3/M4 helpers, cleanup ordering, sensitive-data discipline, and the M5 blocker.
 - `docs/module-map.md` - documented `supervisor.py` and `encoder/ffmpeg.py`; updated `cli.py` row for the `run` command; expanded `errors.py` row to list the new `StreamingRuntimeError` family; trimmed the "deferred submodules" table (encoder/supervisor moved out of deferred).
 - `docs/api-contracts.md` - added an M5-prep note up top: no new endpoints; `upstream run` keeps the session open for the lifetime of the stream and only stops it on shutdown. Documented the M5-real-smoke blocker.
-- `docs/troubleshooting.md` - new "Live streaming (`upstream run`)" section with entries for FFmpeg start failure, pipe-closed mid-stream, camera read failure during run, session-won't-end-after-Ctrl-C, the early-exit symptom that points at the API ingest host/port issue, and the dev override usage (marked temporary).
+- `docs/troubleshooting.md` - new "Live streaming (`upstream run`)" section with entries for FFmpeg start failure, pipe-closed mid-stream, camera read failure during run, session-won't-end-after-Ctrl-C, and the early-exit symptom that points at an unreachable SRT host/port.
 
 ### Functions/classes changed
 - `FfmpegEncoderProcess` (new) - managed FFmpeg subprocess wrapper. Only ever exposes the redacted command via `__repr__` / errors.
 - `run_agent` / `RunResult` (new) - live streaming orchestrator. Never raises `ApiError` directly; wraps API approval failures in `StreamingRuntimeError`.
-- `OVERRIDE_ENV_NAME` constant in `supervisor.py` - the dev override env var name.
 - `StreamingRuntimeError` and the `FfmpegRuntimeError` family - new typed errors. The supervisor uses `StreamingRuntimeError` for non-FFmpeg failures it surfaces (e.g. API approval). FFmpeg-specific failures use the more specific subclasses.
 - `check_cmd` (CLI) - unchanged; `run_cmd` is a sibling command, not a flag.
 
@@ -74,7 +79,6 @@ The redaction filter in `setup_logging` is unchanged; the supervisor's own disci
 
 ### Follow-up TODOs
 - **Real end-to-end smoke** once `upstream-api-server` returns a correct local/dev ingest host/port. This is the only remaining piece for M5 proper.
-- **Remove `UPSTREAM_DEV_SRT_URL_OVERRIDE`** once the API blocker is fixed. The override is documented only in `docs/troubleshooting.md`; pull it out of `supervisor.py` and the troubleshooting doc when it's no longer needed.
 - Milestone 6: heartbeat loop (`heartbeat/reporter.py`).
 - Milestone 7: reconnect/backoff on transient FFmpeg or API failures.
 - Possible later: `signal.signal(SIGTERM, ...)` handler. Ctrl+C → `KeyboardInterrupt` is sufficient for M5 prep; SIGTERM from systemd matters once the agent is run as a service.

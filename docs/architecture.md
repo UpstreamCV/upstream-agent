@@ -40,18 +40,12 @@ logging with token redaction. Milestone 2 added the camera-source
 layer and `upstream check --camera`. Milestone 3 added the HTTP
 client and `upstream check --api`. Milestone 4 added the local
 FFmpeg/SRT/H264 preflight, the SRT URL parser, the FFmpeg command
-builder, and `upstream check --streaming`. **Milestone 5 prep**
-(this milestone) adds the `FfmpegEncoderProcess` subprocess
-wrapper, the supervisor (`upstream_agent/supervisor.py`), and
-`upstream run` — the first command that actually streams video.
-
-The runtime works end-to-end under fakes/mocks. Real-backend smoke
-against MediaMTX is still gated on `upstream-api-server` returning
-an SRT URL whose host/port reaches the running MediaMTX. A
-temporary env-only dev override
-(`UPSTREAM_DEV_SRT_URL_OVERRIDE`) unblocks local testing in the
-meantime; it will be removed once the API ingest host/port issue
-is fixed.
+builder, and `upstream check --streaming`. **Milestone 5** adds the
+`FfmpegEncoderProcess` subprocess wrapper, the supervisor
+(`upstream_agent/supervisor.py`), and `upstream run` — the first
+command that actually streams video. `upstream run` uses the SRT
+URL returned by `/v1/stream-sessions/start` end-to-end against
+MediaMTX.
 
 | Layer | Status |
 | --- | --- |
@@ -245,7 +239,7 @@ reuses every M3/M4 module verbatim:
   `run_agent` holds onto the `StreamSessionResponse` only long
   enough to extract the SRT URL into a local variable.
 - :func:`upstream_agent.transport.srt.parse_srt_url` — validates
-  the API-issued URL (and, if set, the dev override URL).
+  the API-issued URL.
 - :func:`upstream_agent.encoder.command_builder.build_ffmpeg_command`
   and :func:`redact_command` — produce the raw FFmpeg argv (with
   the URL) and a redacted copy for logs/repr.
@@ -294,18 +288,6 @@ existing `start`/`stop` pair is sufficient.
   `FfmpegWriteError`) never contain the URL; if FFmpeg echoes the
   URL in its own stderr, the wrapper scrubs any line containing
   `srt://` before quoting a short tail.
-- The dev override warning is a fixed string with no URL substring.
-
-**M5-prep blocker.** The end-to-end smoke against a real MediaMTX
-is gated on `upstream-api-server` returning an SRT URL whose
-host/port reaches the running MediaMTX. The runtime is otherwise
-fully functional — the mocked tests prove every cleanup path. A
-temporary, undocumented-in-README env override
-(`UPSTREAM_DEV_SRT_URL_OVERRIDE`) lets local development swap the
-SRT URL handed to FFmpeg while keeping the real API session
-start/stop intact. The override is documented in
-`docs/troubleshooting.md` only and will be removed once the API
-returns a correct local/dev ingest host/port.
 
 ## Design principles
 
