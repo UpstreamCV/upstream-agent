@@ -336,6 +336,224 @@ near-misses we already test for: error messages from the API client,
 log records emitted by httpx when debug logging is on, and config
 display in `upstream status`.
 
+## Streaming preflight (`upstream check --streaming`)
+
+### `Error (ffmpeg): FFmpeg is not installed or not on PATH.`
+
+The agent looks for `ffmpeg` on `PATH`. Install it (the agent does
+not install it for you):
+
+- **macOS**: `brew install ffmpeg` (verify that the build includes
+  `libsrt` and `libx264` — see the next entry).
+- **Linux**: `apt install ffmpeg` (Debian/Ubuntu) or your distro's
+  equivalent. SRT support depends on how the distro built the
+  package.
+- **Windows**: a static FFmpeg build from a trusted source. Make
+  sure `ffmpeg.exe` is on `PATH`.
+
+Verify by running `ffmpeg -version` in the same shell where you'll
+run `upstream`.
+
+### `Error (srt_support): FFmpeg is installed, but this build does not support SRT.`
+
+Your `ffmpeg` binary was compiled without `libsrt`. The agent can
+detect this — `ffmpeg -protocols | grep -w srt` returns nothing
+(only `srtp`, which is unrelated). Reinstall with libsrt enabled:
+
+- **macOS (Homebrew)**: the default `brew install ffmpeg` formula
+  does **not** ship with libsrt on most bottles. Install the
+  `ffmpeg-full` formula instead:
+
+  ```bash
+  brew uninstall ffmpeg
+  brew install ffmpeg-full
+  ```
+
+  After reinstall, confirm with `ffmpeg -protocols | grep -w srt` —
+  you should see a bare `srt` line (not just `srtp`). Then re-run
+  `upstream check --streaming`.
+- **Linux**: install the version that includes `libsrt`, or compile
+  from source with `--enable-libsrt`.
+- **Windows**: pick a static build advertised as including libsrt.
+
+### `Error (h264_encoder): FFmpeg is installed but no usable H264 encoder is available.`
+
+The build does not include `libx264` and no platform H264 encoder
+(`h264_videotoolbox` on macOS, `h264_nvenc` on NVIDIA, etc.) is
+available either. Install an FFmpeg build with libx264.
+
+### `Error (start_stream_session): ...` during `--streaming`
+
+The local FFmpeg/SRT/H264 phases passed but the API rejected the
+session-start. This is the same error you'd see from
+`upstream check --api`; the troubleshooting under "API" applies.
+
+### `Error (srt_url_parse): Approved SRT URL is invalid: ...`
+
+The server returned an SRT URL that fails parsing (wrong scheme,
+missing host, missing port). The agent does **not** echo the URL in
+the error message. If this fires, the backend probably regressed —
+share the `request_id` from the matching API error (if any) with the
+backend team. The agent still stops the temporary session before
+exiting, so the camera slot is released.
+
+### `Error (command_build): ...`
+
+The approved config the server returned is something the M4 command
+builder cannot encode (e.g. a codec other than H264). The most
+common cause is a server-side update that returned a new codec
+without bumping the client. The agent stops the temporary session
+before exiting.
+
+### `Warning: failed to stop stream session after check`
+
+Mirrors the same warning under `--api`. The check itself succeeded;
+the server-side session will expire on its own. If this fires
+consistently, look at the server logs for the `stop_stream_session`
+endpoint.
+
+### Streaming check passes but `upstream` cannot actually stream yet
+
+That is expected as of Milestone 4. `upstream check --streaming`
+verifies every prerequisite for streaming but does not start a
+long-running FFmpeg process or push any frames. Live streaming
+lands in Milestone 5.
+
+## Live streaming (`upstream run`)
+
+`upstream run` is the first command that actually streams video. It
+opens the camera, requests a stream session, launches FFmpeg, pipes
+BGR frames over SRT, and stops everything cleanly on `Ctrl+C` (or
+on any error).
+
+### `Error: FFmpeg binary not found.` or `FFmpeg is not installed or not on PATH.`
+
+The `upstream check --streaming` troubleshooting entries above apply
+verbatim. The runtime probes FFmpeg before opening the camera or
+contacting the API, so a missing/unsupported binary fails fast
+without side effects.
+
+### `Error (register_agent|register_camera|start_stream_session): ...`
+
+The API rejected the run before any FFmpeg subprocess was started.
+Same diagnostics as `upstream check --api`: confirm your token,
+verify the camera config is valid, and check `request_id` in the
+error message with the backend team.
+
+### `Error: FFmpeg pipe closed; exit_code=...`
+
+FFmpeg exited while the agent was still piping frames. This is the
+runtime's `FfmpegWriteError`. Common causes:
+
+- The SRT server (MediaMTX) refused or dropped the connection.
+- A network blip closed the underlying TCP/UDT link.
+- FFmpeg's stderr (if anything was emitted that didn't contain
+  `srt://`) is included as a short scrubbed snippet — that's the
+  best hint.
+
+The error message contains the FFmpeg exit code but never echoes
+the SRT URL.
+
+### `Error: FFmpeg exited mid-stream with code ...`
+
+Same root cause as the previous entry, detected by the supervisor's
+post-write `poll()`. The supervisor stops the camera and the API
+session before propagating.
+
+### `Error: Camera was opened but failed to read a frame.`
+
+The webcam was disconnected or stopped producing data mid-stream.
+The supervisor stops FFmpeg, releases the camera, and stops the
+API session before propagating. Reconnecting the camera and re-
+running is the fix.
+
+### Stream session won't end after Ctrl+C
+
+The supervisor's cleanup tries to stop the session best-effort. If
+the server is unreachable at shutdown, the agent prints
+`Warning: failed to stop stream session: ...` and exits 0 anyway.
+The server-side session will expire on its own.
+
+### `upstream run` ends immediately with "Stream session stopped" and no `Streaming started`
+
+The SRT URL returned by `/v1/stream-sessions/start` points at a
+host or port the agent cannot reach — the underlying SRT push
+fails before any frame is written, and FFmpeg exits quickly. Check
+that the streaming server is reachable from this machine and that
+`upstream-api-server` is configured with the correct ingest
+host/port for this environment. The agent now uses only the
+API-issued SRT URL; the previous temporary local-dev SRT URL
+override was removed after real API-issued streaming was verified
+end-to-end.
+
+## Heartbeat / dashboard offline (`upstream run`)
+
+While `upstream run` is active, a background thread POSTs a
+heartbeat to `POST /v1/heartbeats` every 5 seconds. The dashboard
+uses those to mark the camera/session online and surface basic
+runtime telemetry (fps, bitrate, resolution, last error).
+
+### Dashboard shows the camera offline but `upstream run` is still streaming
+
+Check `~/.upstream/logs/agent.log` for `Heartbeat send failed
+(transient): ...` lines. Common causes:
+
+- **API unreachable from the agent host** — network blip, DNS,
+  proxy. The agent will keep retrying on the next 5-second tick.
+  Run `upstream check --api` in a second terminal to confirm
+  baseline connectivity.
+- **API server slow / 5xx** — the warning carries the `code=` and
+  `request_id=` from the server response; share those with
+  support.
+- **Clock skew** — heartbeat `reported_at` is in UTC and the
+  server response includes its own `server_time`; large skew can
+  confuse the dashboard's "online" window.
+
+The stream itself is not affected — heartbeat failures are
+non-fatal by default.
+
+### `upstream run` exits with `exit_reason=fatal_heartbeat`
+
+The heartbeat endpoint returned a clearly-fatal error and the
+runtime shut down cleanly. The CLI log line above the exit will
+identify which:
+
+- `ApiTokenRevokedError` — token was revoked server-side.
+  Generate a new token from the dashboard and rewrite
+  `api.token` in `~/.upstream/config.yaml`.
+- `ApiTokenExpiredError` — token expired. Same fix.
+- `ApiValidationError` — usually `403 forbidden_resource` (the
+  `camera_id` or `session_id` in the heartbeat is not owned by
+  this agent, e.g. the camera was deleted from the dashboard
+  mid-stream) or `422 validation_error` (agent bug — please
+  report). Re-running after the token / camera issue is fixed
+  picks up cleanly.
+
+### Heartbeat send succeeds but the dashboard still shows offline
+
+Confirm the `agent_id` query parameter matches the registered
+agent by inspecting recent heartbeats via the API directly:
+
+```
+curl -H "Authorization: Bearer <token>" \
+  https://api.upstreamcv.com/v1/agents/<agent_id>/heartbeats?limit=5
+```
+
+A non-empty list with `reported_at` advancing every ~5 seconds
+means the agent side is working — the dashboard's stale-time
+window may simply not have refreshed yet, or its threshold for
+"online" is longer than 5 seconds.
+
+### `agent_id missing from state; heartbeat reporter not started.`
+
+Defensive log line emitted when `state.agent_id` is `None` at the
+point the supervisor is about to start the heartbeat thread. In
+normal operation `_obtain_stream_approval` sets `agent_id` during
+registration; if you see this, your local
+`~/.upstream/agent_state.json` may have been deleted between
+registration and the streaming phase. Delete the state file
+entirely and re-run — the agent will register fresh.
+
 ## Installation
 
 ### `pip install -e .` fails on Python 3.9 or older

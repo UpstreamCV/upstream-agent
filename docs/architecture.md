@@ -33,33 +33,41 @@ to the UpStream streaming server.
            heartbeat (status, errors, metrics) ──▶ UpStream API
 ```
 
-## What exists today (Milestones 1, 2, and 3)
+## What exists today (Milestones 1–6)
 
-The foundation, a local camera probe, and a three-step API
-registration probe. Milestone 1 delivered the CLI, config loader,
-local state, and logging with token redaction. Milestone 2 added the
-camera-source layer and `upstream check --camera`. Milestone 3 added
-the HTTP client foundation (`upstream_agent/api/`) and
-`upstream check --api`, which proves the backend approves this agent
-+ camera for streaming — stopping short of any actual video transport.
-
-Nothing yet encodes video or streams.
+Milestone 1 delivered the CLI, config loader, local state, and
+logging with token redaction. Milestone 2 added the camera-source
+layer and `upstream check --camera`. Milestone 3 added the HTTP
+client and `upstream check --api`. Milestone 4 added the local
+FFmpeg/SRT/H264 preflight, the SRT URL parser, the FFmpeg command
+builder, and `upstream check --streaming`. Milestone 5 adds the
+`FfmpegEncoderProcess` subprocess wrapper, the supervisor
+(`upstream_agent/supervisor.py`), and `upstream run` — the first
+command that actually streams video. **Milestone 6** adds the
+heartbeat loop: a background thread that POSTs runtime telemetry
+(status, fps, bitrate, resolution, last error) to
+`POST /v1/heartbeats` every 5 seconds while the stream is active.
 
 | Layer | Status |
 | --- | --- |
-| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api`, `--version`) | done |
+| CLI (`upstream init`, `upstream status`, `upstream check --camera` / `--api` / `--streaming`, `upstream run`, `--version`) | done |
 | Config loader (YAML + Pydantic validation) | done |
 | Local state (`agent_state.json` with stable `device_id`, `agent_id`, `last_camera_id`) | done |
 | Logging (rotating file + stderr, token redaction) | done |
 | Camera sources (`VideoSource` ABC + `WebcamSource`) | partial (webcam only) |
-| API client (register-agent / register-camera / start-stream-session) | M3 contract confirmed; mocked tests green; real smoke pending |
-| Diagnostics (`upstream check --camera`, `--api`) | partial (camera + API only) |
-| Token rotation, config fetch, heartbeat, event endpoints | **planned** |
-| RTSP / IP camera / file sources | **planned** |
+| API client (register-agent / register-camera / start/stop-stream-session / heartbeat) | M3–M6 contract confirmed; mocked tests green |
+| Diagnostics (camera, API, streaming preflight) | done |
+| FFmpeg probe (version / SRT protocol / H264 encoder) | done |
+| SRT URL parsing/validation | done |
+| FFmpeg command builder | done |
+| Honest agent capabilities reporting via `register_agent` | done |
+| FFmpeg subprocess wrapper (`FfmpegEncoderProcess`) | done (M5) |
+| Supervisor / runtime (`run_agent`) | done (M5–M6) |
+| Live SRT streaming end-to-end against real MediaMTX | done (M5) |
+| Heartbeat loop + runtime health reporting | done (M6) |
 | Frame buffer | **planned** |
-| FFmpeg encoder | **planned** |
-| SRT transport | **planned** |
-| Supervisor (orchestrates the running agent) | **planned** |
+| Reconnect/backoff, session refresh, token rotation, config fetch | **planned (M7+)** |
+| RTSP / IP camera / file sources | **planned** |
 
 ## Camera source layer
 
@@ -155,6 +163,203 @@ later failure does not lose earlier IDs.
 The check stops *before* any streaming. Future milestones will read
 the SRT URL from a fresh `start_stream_session` call when they
 actually need to connect to the streaming server.
+
+## Local preflight layer (Milestone 4)
+
+`upstream check --streaming` answers a single question — *is this
+machine ready to stream?* — without actually streaming. The phases
+chain together like this:
+
+```
+Config ── FFmpeg probe ── API approval ── SRT URL parse ── command build
+                │             │              │                 │
+            version,      approved      validate scheme,    list[str] —
+            srt support,  config +      host, port, mode   construction
+            H264 encoder  SRT URL                          only; not run
+```
+
+The orchestrator is :func:`upstream_agent.diagnostics.streaming.run_streaming_check`.
+It composes three independent modules:
+
+- :mod:`upstream_agent.diagnostics.ffmpeg_check` —
+  :func:`probe_ffmpeg` runs ``ffmpeg -version`` / ``-protocols`` /
+  ``-encoders`` via a safe ``subprocess.run`` (no shell, timeouts,
+  captured stdout/stderr) and returns a :class:`FfmpegProbeResult`
+  describing what the local binary supports.
+- :mod:`upstream_agent.transport.srt` — :func:`parse_srt_url`
+  validates the approved SRT URL and returns a :class:`ParsedSrtUrl`
+  with only safe-to-display metadata (booleans, the port, the mode,
+  and the latency). The raw URL, host, and streamid are never stored
+  on the result.
+- :mod:`upstream_agent.encoder.command_builder` —
+  :func:`build_ffmpeg_command` returns the ``list[str]`` argv that
+  Milestone 5 will execute. The list is constructed only to prove it
+  builds; M4 discards it immediately. :func:`redact_command` exists
+  for any future need to display the command — it replaces the SRT
+  URL with the literal ``srt://<redacted>``.
+
+The API approval phase shares logic with `upstream check --api` via
+the private :func:`_obtain_stream_approval` helper in
+:mod:`upstream_agent.diagnostics.api`. Both orchestrators build the
+same `register_agent` / `register_camera` / `start_stream_session`
+payloads and both stop the session before returning. The shared
+helper also receives a `capabilities` dict so the streaming check
+can pass its FFmpeg probe results straight into `register_agent` —
+making the backend's view of "what can this agent do" honest.
+
+**Capabilities reporting.** Before Milestone 4 the agent always sent
+`{"ffmpeg": false, "srt": false}` to `register_agent`. After
+Milestone 4, both `--api` and `--streaming` probe FFmpeg once and
+send `{"ffmpeg": "<version>", "srt": <bool>}` based on what the
+local binary actually supports. The probe is fast (~50 ms) and runs
+only when the check needs to call the API.
+
+## Runtime layer (Milestone 5 prep)
+
+`upstream run` is the live streaming command. The runtime chains
+the existing pieces:
+
+```
+Config ── FFmpeg probe ── Camera open ── API session approval ── Command build ── FFmpeg start ── Frame loop ── Cleanup
+                                              │
+                                          (session held open
+                                           for the lifetime of
+                                           the run, not stopped
+                                           immediately)
+```
+
+The orchestrator is :func:`upstream_agent.supervisor.run_agent`. It
+reuses every M3/M4 module verbatim:
+
+- :func:`upstream_agent.diagnostics.ffmpeg_check.probe_ffmpeg` —
+  probes the local binary; results feed both the capability payload
+  sent to `register_agent` and the H264 encoder chosen for the
+  output command.
+- :func:`upstream_agent.diagnostics.api._obtain_stream_approval` —
+  same private helper used by `upstream check --api` and
+  `upstream check --streaming`. Returns the same outcome shape;
+  `run_agent` holds onto the `StreamSessionResponse` only long
+  enough to extract the SRT URL into a local variable.
+- :func:`upstream_agent.transport.srt.parse_srt_url` — validates
+  the API-issued URL.
+- :func:`upstream_agent.encoder.command_builder.build_ffmpeg_command`
+  and :func:`redact_command` — produce the raw FFmpeg argv (with
+  the URL) and a redacted copy for logs/repr.
+- :class:`upstream_agent.encoder.ffmpeg.FfmpegEncoderProcess` —
+  owns the `subprocess.Popen`, the stdin pipe, and the lifecycle
+  (`start`, `write_frame`, `poll`, `stop`).
+- :class:`upstream_agent.sources.webcam.WebcamSource` — context-
+  managed BGR frame source.
+
+The frame loop is intentionally simple: read a frame, resize if
+the camera shape doesn't match the server-approved shape, `tobytes`
+it, write to FFmpeg's stdin. After every write the supervisor polls
+FFmpeg; if FFmpeg exited mid-stream the supervisor raises
+:class:`FfmpegExitError` and cleanup runs.
+
+**Cleanup order** is the same regardless of how the loop exits
+(normal completion, max_frames hit, Ctrl+C, FFmpeg start failure,
+mid-stream FFmpeg exit, camera read failure, API approval failure):
+
+1. `FfmpegEncoderProcess.stop()` — closes stdin so FFmpeg can drain
+   the mpegts trailer, then SIGTERM with a timeout, then SIGKILL.
+2. `WebcamSource.close()` — releases the OpenCV capture.
+3. `client.stop_stream_session(session_id)` — best-effort; a
+   failure here is logged as a warning, not propagated.
+
+This ordering matches the user-visible shutdown block (`FFmpeg
+stopped` → `Camera released` → `Stream session stopped`).
+
+**Lifetime difference vs. preflight.** `upstream check --api` and
+`upstream check --streaming` stop the API session almost
+immediately after `start_stream_session` returns. `upstream run`
+keeps the session open for the duration of the frame loop and
+only stops it on shutdown. No new API endpoint is required — the
+existing `start`/`stop` pair is sufficient.
+
+**Sensitive-data discipline.**
+
+- The raw SRT URL lives in a single local variable inside
+  `run_agent` from the moment `_obtain_stream_approval` returns
+  until the supervisor exits. It is passed once into
+  `build_ffmpeg_command` and once into
+  `FfmpegEncoderProcess(command, redacted_command)`. It is never
+  stored on the result object or any persisted state.
+- `FfmpegEncoderProcess.__repr__` returns only the redacted argv.
+  Error messages from the wrapper (`FfmpegStartError`,
+  `FfmpegWriteError`) never contain the URL; if FFmpeg echoes the
+  URL in its own stderr, the wrapper scrubs any line containing
+  `srt://` before quoting a short tail.
+
+## Runtime health (Milestone 6)
+
+`upstream run` now reports liveness back to the API on a 5-second
+cadence so the dashboard can mark the camera/session online and
+show basic telemetry. Two new modules implement this:
+
+- :class:`upstream_agent.runtime.stats.RuntimeStats` — a small
+  thread-safe counter object. The frame loop in
+  :func:`run_agent` calls ``record_frame`` after every successful
+  write to FFmpeg; the heartbeat thread calls ``snapshot`` once
+  per interval. The snapshot is a frozen
+  :class:`StatsSnapshot` dataclass with ``frames_written``,
+  rolling ``fps`` (computed over the last 60 frames),
+  ``camera_connected``, ``ffmpeg_running``, ``last_frame_at``,
+  and ``last_error``.
+- :class:`upstream_agent.heartbeat.reporter.HeartbeatReporter` —
+  one daemon :class:`threading.Thread`. Its loop snapshots the
+  stats, builds a :class:`Heartbeat` from the snapshot + the
+  server-approved stream config + ``__version__``, and POSTs it
+  via :meth:`UpstreamApiClient.send_heartbeat`. The reporter
+  sleeps on a :class:`threading.Event` so calling :meth:`stop`
+  wakes the thread immediately rather than waiting out the
+  interval.
+
+The heartbeat side-channel runs **alongside** the frame loop;
+neither blocks the other:
+
+```
+   Camera ──► resize ──► FFmpeg.write_frame ──► stats.record_frame
+                                                       │
+                                                       ▼
+                                              RuntimeStats (thread-safe)
+                                                       ▲
+                                                       │ snapshot()
+                                          HeartbeatReporter thread
+                                                       │
+                                                       ▼
+                                              POST /v1/heartbeats
+                                                       │
+                                                       ▼
+                                                  UpStream API
+```
+
+**Failure handling** is intentionally minimal for M6:
+
+- *Transient* failures (network blip, 5xx, 429, generic
+  :class:`ApiError`) log a warning and try again on the next
+  tick. There is no exponential backoff yet — that lands in M7.
+- *Fatal* failures (:class:`ApiTokenRevokedError`,
+  :class:`ApiTokenExpiredError`, :class:`ApiValidationError`)
+  stop the reporter thread and store a reason string. The
+  supervisor checks :meth:`HeartbeatReporter.fatal_reason` after
+  every frame; if it becomes non-``None`` the loop exits cleanly
+  with ``exit_reason="fatal_heartbeat"`` and the usual cleanup
+  chain runs.
+
+**Cleanup ordering** during shutdown is now
+heartbeat → FFmpeg → camera → API session. Stopping the
+heartbeat first means the dashboard sees no further "streaming"
+pings after the agent has decided to shut down, even if FFmpeg
+teardown takes a moment.
+
+**Sensitive-data discipline for heartbeats.** The heartbeat
+payload contains no SRT URL, streamid, or session token — only
+the camera UUID, the session UUID, an enum status, and numeric
+telemetry. The only sensitive value involved is the bearer token,
+which is attached by :meth:`UpstreamApiClient._build_auth_header`
+and never logged (the redaction filter scrubs it as a second
+line of defense).
 
 ## Design principles
 

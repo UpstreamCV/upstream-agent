@@ -74,3 +74,51 @@ class ApiServerError(ApiError):
 
 class ApiContractError(ApiError):
     """Raised when an API response is missing required fields or is not valid JSON."""
+
+
+class FfmpegError(UpstreamError):
+    """Base class for FFmpeg-related failures."""
+
+
+class FfmpegNotFoundError(FfmpegError):
+    """Raised when the ffmpeg binary is not installed or not on PATH."""
+
+
+class FfmpegProbeError(FfmpegError):
+    """Raised when ffmpeg is present but a probe subprocess fails."""
+
+
+class FfmpegSrtUnsupportedError(FfmpegError):
+    """Raised when the installed ffmpeg build does not support the SRT protocol."""
+
+
+class FfmpegH264UnsupportedError(FfmpegError):
+    """Raised when no usable H264 encoder is available in this ffmpeg build."""
+
+
+class SrtUrlError(UpstreamError):
+    """Raised when an SRT URL is missing required parts or has the wrong scheme."""
+
+
+class CommandBuildError(UpstreamError):
+    """Raised when the FFmpeg command line cannot be built from approved config."""
+
+
+class StreamingRuntimeError(UpstreamError):
+    """Base class for failures that surface while the streaming runtime is active."""
+
+
+class FfmpegRuntimeError(StreamingRuntimeError):
+    """Base class for errors raised by the FFmpeg subprocess wrapper."""
+
+
+class FfmpegStartError(FfmpegRuntimeError):
+    """Raised when the FFmpeg subprocess cannot be launched."""
+
+
+class FfmpegWriteError(FfmpegRuntimeError):
+    """Raised when writing a frame to FFmpeg's stdin pipe fails."""
+
+
+class FfmpegExitError(FfmpegRuntimeError):
+    """Raised when FFmpeg exits unexpectedly while the runtime is streaming."""

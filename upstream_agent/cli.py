@@ -12,6 +12,14 @@ Three subcommands today:
 * ``upstream check --api`` — three-step API probe. Registers the agent,
   registers the camera, and requests a stream session. Stops before
   any streaming. Never prints the full token or SRT URL.
+* ``upstream check --streaming`` — local streaming preflight. Probes
+  FFmpeg/SRT/H264, obtains an approved SRT URL via the API flow,
+  validates the URL, builds the FFmpeg command Milestone 5 will
+  execute, then stops the temporary session. Does not stream.
+* ``upstream run`` — live streaming. Opens the camera, requests a
+  stream session, launches FFmpeg, and pipes BGR frames over SRT
+  until ``Ctrl+C``. Cleanly stops FFmpeg, releases the camera, and
+  stops the API session on exit.
 
 ``--version`` prints the package version and exits.
 
@@ -34,9 +42,14 @@ from upstream_agent.config import (
 )
 from upstream_agent.diagnostics.api import ApiCheckResult, run_api_check
 from upstream_agent.diagnostics.camera import CameraCheckResult, run_camera_check
+from upstream_agent.diagnostics.streaming import (
+    StreamingCheckResult,
+    run_streaming_check,
+)
 from upstream_agent.errors import UpstreamError
 from upstream_agent.logging_setup import redact_token, setup_logging
 from upstream_agent.state import State, default_state_path, load_state, save_state
+from upstream_agent.supervisor import run_agent
 from upstream_agent.version import __version__
 
 app = typer.Typer(
@@ -202,6 +215,31 @@ def _print_camera_check_success(result: CameraCheckResult) -> None:
         )
 
 
+def _print_streaming_check_success(result: StreamingCheckResult) -> None:
+    typer.echo("Streaming preflight successful")
+    if result.ffmpeg_version:
+        typer.echo(f"FFmpeg: found, version {result.ffmpeg_version}")
+    else:
+        typer.echo("FFmpeg: found, version unknown")
+    typer.echo("SRT support: yes")
+    encoder_label = result.h264_encoder or "yes"
+    typer.echo(f"H264 encoder: yes ({encoder_label})")
+    typer.echo("API stream approval: yes")
+    typer.echo(
+        f"Approved config: {result.approved_codec}, "
+        f"{result.approved_width}x{result.approved_height} @ "
+        f"{result.approved_fps} FPS, "
+        f"{result.approved_bitrate_kbps} kbps, "
+        f"{result.approved_latency_mode}"
+    )
+    typer.echo(
+        f"SRT URL received: {'yes' if result.srt_url_present else 'no'}"
+    )
+    typer.echo(
+        f"FFmpeg command build: {'yes' if result.command_build_success else 'no'}"
+    )
+
+
 def _print_api_check_success(result: ApiCheckResult) -> None:
     typer.echo("API check successful")
     typer.echo(f"Agent registered: {result.agent_id}")
@@ -234,18 +272,28 @@ def check_cmd(
             "stream session. Stops before streaming."
         ),
     ),
+    streaming: bool = typer.Option(
+        False,
+        "--streaming",
+        help=(
+            "Streaming preflight: FFmpeg, SRT support, H264 encoder, "
+            "API approval, SRT URL validity, FFmpeg command build. "
+            "Does NOT stream."
+        ),
+    ),
     config: Path | None = typer.Option(
         None,
         "--config",
         help="Override the config file path (default: ~/.upstream/config.yaml).",
     ),
 ) -> None:
-    """Run local diagnostics. Supports ``--camera`` and ``--api``."""
+    """Run local diagnostics. Supports ``--camera``, ``--api``, and ``--streaming``."""
 
-    if not camera and not api:
+    if not camera and not api and not streaming:
         typer.echo(
-            "Specify what to check, e.g. `upstream check --camera` or "
-            "`upstream check --api`. See `upstream check --help` for options.",
+            "Specify what to check, e.g. `upstream check --camera`, "
+            "`upstream check --api`, or `upstream check --streaming`. "
+            "See `upstream check --help` for options.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -262,10 +310,11 @@ def check_cmd(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from None
 
-    if api and cfg.api.is_placeholder_token:
+    needs_api = api or streaming
+    if needs_api and cfg.api.is_placeholder_token:
         typer.echo(
             "Error: API token is still a placeholder. Edit "
-            f"{config_path} (api.token) and re-run 'upstream check --api'.",
+            f"{config_path} (api.token) and re-run.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -316,6 +365,7 @@ def check_cmd(
             overall_ok = False
         else:
             _print_api_check_success(api_result)
+            printed_a_block = True
             if api_result.stop_warning is not None:
                 # Cleanup stop failed. The check itself succeeded, so
                 # exit stays 0 — but warn the operator so they know
@@ -326,5 +376,108 @@ def check_cmd(
                     err=True,
                 )
 
+    if streaming:
+        if printed_a_block:
+            typer.echo("")
+        state = load_state(default_state_path())
+
+        def _persist_streaming(updated: State) -> None:
+            save_state(updated, default_state_path())
+
+        stream_result, updated_state = run_streaming_check(
+            cfg, state, save_progress=_persist_streaming
+        )
+        save_state(updated_state, default_state_path())
+
+        if not stream_result.success:
+            typer.echo(
+                f"Error ({stream_result.failed_step}): {stream_result.error}",
+                err=True,
+            )
+            overall_ok = False
+            if stream_result.stop_warning is not None:
+                typer.echo(
+                    f"Warning: failed to stop stream session after check: "
+                    f"{stream_result.stop_warning}",
+                    err=True,
+                )
+        else:
+            _print_streaming_check_success(stream_result)
+            if stream_result.stop_warning is not None:
+                typer.echo(
+                    f"Warning: failed to stop stream session after check: "
+                    f"{stream_result.stop_warning}",
+                    err=True,
+                )
+
     if not overall_ok:
         raise typer.Exit(code=1)
+
+
+@app.command("run")
+def run_cmd(
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Override the config file path (default: ~/.upstream/config.yaml).",
+    ),
+) -> None:
+    """Stream video to UpStream. Press Ctrl+C to stop."""
+
+    config_path = resolve_config_path(config)
+    if not config_path.exists():
+        typer.echo(f"No config found at {config_path}.", err=True)
+        typer.echo("Run 'upstream init' to create one.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        cfg = load_config(config_path, allow_placeholder=True)
+    except UpstreamError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    if cfg.api.is_placeholder_token:
+        typer.echo(
+            "Error: API token is still a placeholder. Edit "
+            f"{config_path} (api.token) and re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    sensitive = (
+        {cfg.api.token}
+        if cfg.api.token and not cfg.api.is_placeholder_token
+        else set()
+    )
+    setup_logging(
+        level=cfg.logging.level,
+        log_dir=_default_log_dir(),
+        sensitive_values=sensitive,
+    )
+
+    state = load_state(default_state_path())
+
+    def _persist_run(updated: State) -> None:
+        save_state(updated, default_state_path())
+
+    def _on_event(stage: str, message: str) -> None:
+        typer.echo(message)
+
+    typer.echo("Starting UpStream agent...")
+    try:
+        _result, updated_state = run_agent(
+            cfg,
+            state,
+            save_progress=_persist_run,
+            on_event=_on_event,
+        )
+    except KeyboardInterrupt:
+        # The supervisor's finally block already cleaned up and emitted
+        # the shutdown lines; just exit 0.
+        save_state(load_state(default_state_path()), default_state_path())
+        raise typer.Exit(code=0) from None
+    except UpstreamError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    save_state(updated_state, default_state_path())

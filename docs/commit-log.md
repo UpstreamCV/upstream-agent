@@ -48,6 +48,168 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-13 - feat: heartbeat loop + runtime health reporting (Milestone 6)
+
+### Summary
+Milestone 6 adds the heartbeat side-channel. While `upstream run` is streaming, a background daemon thread POSTs to `POST /v1/heartbeats?agent_id=<uuid>` every 5 seconds with the runtime's current status, fps, bitrate, resolution, codec, and last error. The dashboard uses those heartbeats to mark the camera/session online and surface basic telemetry; the API additionally bumps `agents.last_seen_at` and `cameras.updated_at` server-side. No reconnect/backoff and no session refresh — both are deferred to M7. Fatal API responses (token revoked/expired, body validation) stop the agent cleanly with a new `exit_reason="fatal_heartbeat"`.
+
+The contract used here was read verbatim from `../upstream-api-server` (`routers/heartbeats.py`, `schemas/heartbeats.py`, the 20260513120000 migration). No API-side changes were made.
+
+### Files touched
+- `upstream_agent/api/schemas.py` - added `HeartbeatStatus = Literal["online", "streaming", "error", "reconnecting"]`, `Heartbeat` (request body item, `extra="forbid"`, with the same numeric bounds the server enforces — fps 0..1000, bitrate_kbps 0..200000, width 1..7680, height 1..4320, codec ≤32, last_error ≤512, agent_version ≤64), `HeartbeatBatchRequest` (`heartbeats` list of 1..100), and `HeartbeatBatchResponse` (`accepted` + `server_time`, `extra="ignore"`). Added `datetime` import.
+- `upstream_agent/api/client.py` - added `HEARTBEAT_PATH = "/v1/heartbeats"`. Extended `_request` with an optional `params: dict[str, str] | None = None` argument passed through to `httpx.Client.request`. Added `send_heartbeat(*, agent_id, heartbeat)` that wraps a single-item batch and passes `agent_id` as a query parameter. Reuses the same auth, redaction, and `_raise_for_status` machinery as every other endpoint — token never appears in logs/errors.
+- `upstream_agent/api/__init__.py` - re-exports `HEARTBEAT_PATH`, `Heartbeat`, `HeartbeatBatchRequest`, `HeartbeatBatchResponse`, `HeartbeatStatus`.
+- `upstream_agent/runtime/__init__.py` (new) - re-exports `RuntimeStats`, `StatsSnapshot`.
+- `upstream_agent/runtime/stats.py` (new) - `RuntimeStats` (thread-safe via `threading.Lock`) and `StatsSnapshot` (frozen dataclass). Tracks `frames_written`, a sliding 60-frame monotonic FPS window, `camera_connected`, `ffmpeg_running`, `last_frame_at` (UTC datetime), and `last_error` (auto-truncated to 512 chars to match the heartbeat schema). FPS = `(window-1) / (window[-1] - window[0])` once at least two frames are recorded; `None` for zero or negative span (no `ZeroDivisionError`). `record_frame(monotonic=None, wall_clock=None)` takes optional injection points so tests can drive the FPS window deterministically.
+- `upstream_agent/heartbeat/__init__.py` (new) - re-exports `HeartbeatReporter`, `DEFAULT_HEARTBEAT_INTERVAL_S = 5.0`.
+- `upstream_agent/heartbeat/reporter.py` (new) - `HeartbeatReporter` owns one daemon `threading.Thread`. Loop: snapshot `RuntimeStats` → build `Heartbeat` (`status="streaming"` while `ffmpeg_running`, else `"error"`) → `client.send_heartbeat(...)` → sleep on `stop_event` for `interval_s`. Transient `ApiError` failures log a warning and continue; `ApiTokenRevokedError` / `ApiTokenExpiredError` / `ApiValidationError` set a stored fatal-reason string the supervisor polls via `fatal_reason()`. `start()` is idempotent; `stop(timeout=2.0)` sets the event and joins, logging a warning if the join times out. The `clock` kwarg is an injection point for tests.
+- `upstream_agent/supervisor.py` - added `"fatal_heartbeat"` to the `ExitReason` literal. Added imports for `ApprovedStreamConfig`, `HeartbeatReporter`, `RuntimeStats`, `__version__`. Added `ReporterFactory` type alias and a `_default_reporter_factory` matching the camera/ffmpeg/client factory pattern. `run_agent` now constructs a `RuntimeStats` at the top of the try block, flips `camera_connected` after `cam.open()`, flips `ffmpeg_running` after `ffmpeg.start()`, then constructs and starts the reporter (skipping with a logged warning if `state.agent_id` is `None`). Inside the frame loop: `stats.record_frame()` after every successful write, and a `reporter.fatal_reason()` check that breaks the loop with `exit_reason="fatal_heartbeat"`. All exception handlers now flip `stats.set_ffmpeg_running(False)` and (for `FfmpegExitError` / generic `Exception`) call `stats.record_error(...)`. The `_cleanup` helper takes the reporter as its first argument and stops it before FFmpeg — so the dashboard sees no further "streaming" pings after shutdown begins. Module and function docstrings updated to mention heartbeat in the cleanup order.
+- `tests/test_supervisor.py` - the shared `FakeApiClient.start_stream_session` now echoes `camera_id=req.camera_id` on the returned `Session` so the heartbeat tests can assert the supervisor reads it correctly. Existing tests pass unchanged.
+- `tests/test_runtime_stats.py` (new) - 10 tests covering empty snapshot, frame counter + timestamp, FPS-is-None-until-two-frames, sliding window saturation, zero-span guard, camera/ffmpeg flags, `record_error` round-trip and truncation, eight-thread concurrent `record_frame` smoke, and frozen-dataclass snapshot.
+- `tests/test_api_heartbeat_client.py` (new) - 15 `httpx.MockTransport` tests covering path / query / body shape, Bearer header, None-field omission, every status-code mapping (401 token_revoked, 401 token_expired, 403 forbidden_resource → `ApiAuthError`, 422, 429, 503, connect error), token-leak guards on errors and caplog, and local Pydantic validation (out-of-range fps, unknown status).
+- `tests/test_heartbeat_reporter.py` (new) - 13 reporter tests using a `FakeClient` and a `threading.Event` to wait deterministically for the Nth call. Covers steady-state cadence, `status="streaming"` vs `"error"` based on stats, snapshot data carried into the payload, idempotent `start()`, safe `stop()` before start, fast `stop()` from inside a long interval, transient-failure-then-continue with caplog warning, `ApiTokenRevokedError` / `ApiValidationError` setting `fatal_reason`, unexpected exception logged but loop continues, and leak guards on payload + caplog.
+- `tests/test_supervisor_heartbeat.py` (new) - 5 supervisor-lifecycle tests with a `FakeReporter` injected via `reporter_factory`. Covers start-after-FFmpeg / stop-before-FFmpeg ordering on success, `stats.record_frame` runs once per frame, fatal-reason exit (`exit_reason="fatal_heartbeat"`), missing-`agent_id` skip path (warning logged, stream still runs), `KeyboardInterrupt` stop ordering, and a leak guard on what is passed to the reporter.
+- `docs/api-contracts.md` - added the M6 update note up top and a new "POST /v1/heartbeats" section documenting query parameter, request body (every field, bound, and meaning), 200 response shape, server-side side effects, and the full error-response table including the fatal vs transient mapping. Cites the upstream-api-server files the contract was confirmed against.
+- `docs/architecture.md` - "What exists today" header bumped to Milestones 1–6, status table refreshed (heartbeat done, M5 smoke done, reconnect/refresh moved to M7+). New "Runtime health (Milestone 6)" subsection with the runtime-stats + reporter description, the side-channel diagram, the failure-handling rules, and the updated cleanup order.
+- `docs/module-map.md` - documented `runtime/__init__.py`, `runtime/stats.py`, `heartbeat/__init__.py`, `heartbeat/reporter.py`. Updated `api/__init__.py`, `api/client.py`, `api/schemas.py`, and `supervisor.py` rows for the new symbols / behaviour. Updated `tests/` table with the three new test files and the supervisor-heartbeat additions. Trimmed the deferred-submodules table (heartbeat reporter is no longer deferred; `api/heartbeat.py` is removed because the heartbeat lives under `heartbeat/`, not `api/`).
+- `docs/troubleshooting.md` - new "Heartbeat / dashboard offline (upstream run)" section covering transient-failure warnings, fatal `exit_reason=fatal_heartbeat` causes (revoked / expired / validation), dashboard-still-offline-but-heartbeats-arrived, and the `agent_id missing` defensive log line.
+
+### Functions/classes changed
+- `RuntimeStats` / `StatsSnapshot` (new) - thread-safe runtime telemetry shared between the frame loop and the heartbeat thread.
+- `HeartbeatReporter` (new) - daemon-thread heartbeat sender with stop / fatal-reason semantics.
+- `Heartbeat` / `HeartbeatBatchRequest` / `HeartbeatBatchResponse` / `HeartbeatStatus` (new) - Pydantic request/response models matching the confirmed server contract verbatim.
+- `UpstreamApiClient.send_heartbeat(*, agent_id, heartbeat)` (new) - POST `/v1/heartbeats?agent_id=<uuid>` with a one-item batch.
+- `UpstreamApiClient._request(..., *, params=None)` - extended with an optional query-parameter kwarg. Existing callers continue to work unchanged.
+- `run_agent` - new `reporter_factory` kwarg, internal `RuntimeStats` instance, heartbeat lifecycle wiring (start after FFmpeg, stop before FFmpeg), and a `"fatal_heartbeat"` exit reason. `_cleanup` extended to accept and stop the reporter first.
+
+### System interaction notes
+The heartbeat side-channel runs alongside the frame loop on its own daemon thread; neither blocks the other. The supervisor checks `reporter.fatal_reason()` after each frame, so a token-revoked response causes the loop to exit within at most one frame interval (≈33 ms at 30 fps). Cleanup order is heartbeat → FFmpeg → camera → API session: stopping the heartbeat first means the dashboard sees no further "streaming" pings after the agent has decided to shut down.
+
+The heartbeat payload contains no SRT URL, streamid, or session token — only the camera UUID, session UUID, status enum, and numeric telemetry. The bearer token is attached by the existing `_build_auth_header` and remains the only sensitive value in flight; the redaction filter is still the second line of defense.
+
+`state.agent_id` is now load-bearing for the heartbeat — `_obtain_stream_approval` already sets it during registration, but the supervisor defensively logs a warning and continues without a heartbeat if it ever finds the field unset (rather than crashing the stream).
+
+### Testing/checks
+- `pytest -q` passes (307 tests; 265 from M5 + 42 new across the four M6 test files; plus the one-line update to the shared `FakeApiClient.start_stream_session` to echo `camera_id`).
+- `ruff check upstream_agent tests` — 5 total warnings, all pre-existing baseline (4 B008 typer-Option-in-default in `cli.py`, 1 I001 in `tests/test_token_redaction.py`). No new lint categories.
+- Manual smoke verification plan (with a live `upstream-api-server` and MediaMTX): run `upstream run`, watch `GET /v1/agents/{agent_id}/heartbeats` on the API and confirm rows arrive every ~5s; confirm `agents.last_seen_at` advances; Ctrl+C and confirm the heartbeat thread joins within 2s before FFmpeg/camera/session teardown; force-revoke the token mid-stream and confirm `exit_reason=fatal_heartbeat` with no traceback and no SRT URL in any log output.
+
+### Follow-up TODOs
+- Milestone 7: reconnect/backoff on transient heartbeat / FFmpeg / API failures, session-refresh when a session expires mid-stream, camera recovery on read failures, optional "going offline" final heartbeat on shutdown, and batching of missed heartbeats during a network blip.
+- Optional later: surface `last_heartbeat_accepted` + `server_time` clock-skew on the CLI for operator visibility; for M6 the agent simply discards the response after the typed-error mapping runs.
+- Optional later: per-heartbeat `last_error` lifecycle (currently we only set it from FFmpeg-exited and camera-read-failure paths; transient ApiError in the reporter doesn't update it because the reporter logs the error directly).
+
+---
+
+## Milestone 5 cleanup — removed temporary SRT URL override
+
+After real API-issued SRT streaming was verified end-to-end, the temporary `UPSTREAM_DEV_SRT_URL_OVERRIDE` path was removed. `upstream run` now uses only the SRT URL returned by the API stream session response.
+
+---
+
+## 2026-05-13 - feat: `upstream run` live streaming runtime (Milestone 5 prep)
+
+### Summary
+Milestone 5 prep adds the runtime that ties everything together: `FfmpegEncoderProcess` (a managed `subprocess.Popen` wrapper around ffmpeg), the supervisor (`upstream_agent/supervisor.py`, with `run_agent()`), and `upstream run` — the first command that actually streams video. The runtime chains FFmpeg probe → camera open → API session approval → FFmpeg command build → FFmpeg start → frame loop → cleanup. Every cleanup path (normal completion, `max_frames` hit, FFmpeg start failure, mid-stream FFmpeg exit, camera read failure, API failure, `KeyboardInterrupt`) tears down FFmpeg → camera → API session in that fixed order.
+
+This is **prep**, not full M5: the real end-to-end smoke against MediaMTX is gated on `upstream-api-server` returning an SRT URL whose host/port reaches the running MediaMTX. The runtime is otherwise complete and the mocked tests exercise every cleanup path.
+
+### Files touched
+- `upstream_agent/errors.py` - added `StreamingRuntimeError` (umbrella), `FfmpegRuntimeError`, `FfmpegStartError`, `FfmpegWriteError`, `FfmpegExitError`. All inherit from `UpstreamError` so the top-level CLI catch keeps working.
+- `upstream_agent/encoder/ffmpeg.py` (new) - `FfmpegEncoderProcess(command, redacted_command=None, *, popen_factory=None)`. Wraps `subprocess.Popen` with `shell=False`, `stdin=PIPE`, `stdout=DEVNULL`, `stderr=PIPE`. Public methods: `start()` (idempotent guard; raises `FfmpegStartError` on `FileNotFoundError`/`OSError`), `write_frame(bytes)` (raises `FfmpegWriteError` on `BrokenPipeError`/`OSError` — error messages scrub any `srt://` line out of FFmpeg's own stderr), `poll() -> int | None`, `stop(timeout_seconds=5.0)` (close stdin → terminate → wait → kill on timeout; never raises; idempotent). `__repr__` returns only the redacted argv. The `popen_factory` kwarg lets tests drive a fake `Popen` without any real subprocess.
+- `upstream_agent/encoder/__init__.py` - re-exports `FfmpegEncoderProcess`.
+- `upstream_agent/supervisor.py` (new) - `RunResult` dataclass and `run_agent(cfg, state, *, client_factory=None, camera_factory=None, ffmpeg_factory=None, ffmpeg_probe=None, save_progress=None, max_frames=None, on_event=None)`. Reuses `probe_ffmpeg`, `_obtain_stream_approval` from `diagnostics/api.py`, `build_ffmpeg_command` / `redact_command`, `parse_srt_url`, `WebcamSource`, and the existing `State` / `save_state` flow. The raw SRT URL lives in a single local variable inside this function and is dropped before returning — only safe booleans/IDs cross out. `on_event(stage, message)` is the CLI's hook for printing progress lines. `max_frames` lets tests run a deterministic short loop.
+- `upstream_agent/cli.py` - added `@app.command("run")`, wired through to `run_agent` with a `save_progress` callback and an `on_event` lambda that forwards to `typer.echo`. Catches `KeyboardInterrupt` (exit 0 — clean shutdown) and `UpstreamError` (exit 1). Updated the module docstring to mention `upstream run`.
+- `tests/test_encoder_ffmpeg.py` (new) - 21 tests against an injected fake `Popen`. Real ffmpeg is never invoked. Covers start/idempotency/`FileNotFoundError`/`OSError`, write happy path / `BrokenPipeError` / stderr scrub / other `OSError`, `poll` proxying, `is_running` after exit, stop ordering, kill-after-timeout, stop-before-start no-op, stop idempotency, stop-never-raises, `__repr__` redaction, and `redacted_command` property defensive copy.
+- `tests/test_supervisor.py` (new) - tests against `FakeCamera`/`FakeApiClient`/`FakeFfmpeg`. Covers happy path with `max_frames`, cleanup ordering (FFmpeg → camera → session), capabilities reflecting the probe, `save_progress` called twice, session-started-before-FFmpeg ordering, server-approved-config overriding local-config, FFmpeg start failure with full cleanup, frame write failure with cleanup, camera read failure stopping FFmpeg and session, FFmpeg exit mid-stream raising `FfmpegExitError`, API failure short-circuiting before FFmpeg, `KeyboardInterrupt` cleanup-then-reraise, frame resize via injected fake cv2, no-resize fast path, and leak guards on events / `caplog` / result.
+- `tests/test_cli.py` - 8 new tests for `upstream run`: help message, no-config, placeholder-token, happy path with mocked supervisor, `KeyboardInterrupt` shutdown (exit 0), FFmpeg start failure (exit 1, clean error), API failure (exit 1), and a leak guard.
+- `README.md` - added "Streaming video (preview)" section with the safe output block, flag for the M5-prep blocker, and a quick-start step `upstream run`. Updated the status section: M4 done, M5 in preview, M6+ deferred.
+- `docs/architecture.md` - status table refreshed (M5-prep done; live SRT smoke gated on API fix). New "Runtime layer (Milestone 5 prep)" subsection documenting the supervisor flow, reuse of M3/M4 helpers, cleanup ordering, sensitive-data discipline, and the M5 blocker.
+- `docs/module-map.md` - documented `supervisor.py` and `encoder/ffmpeg.py`; updated `cli.py` row for the `run` command; expanded `errors.py` row to list the new `StreamingRuntimeError` family; trimmed the "deferred submodules" table (encoder/supervisor moved out of deferred).
+- `docs/api-contracts.md` - added an M5-prep note up top: no new endpoints; `upstream run` keeps the session open for the lifetime of the stream and only stops it on shutdown. Documented the M5-real-smoke blocker.
+- `docs/troubleshooting.md` - new "Live streaming (`upstream run`)" section with entries for FFmpeg start failure, pipe-closed mid-stream, camera read failure during run, session-won't-end-after-Ctrl-C, and the early-exit symptom that points at an unreachable SRT host/port.
+
+### Functions/classes changed
+- `FfmpegEncoderProcess` (new) - managed FFmpeg subprocess wrapper. Only ever exposes the redacted command via `__repr__` / errors.
+- `run_agent` / `RunResult` (new) - live streaming orchestrator. Never raises `ApiError` directly; wraps API approval failures in `StreamingRuntimeError`.
+- `StreamingRuntimeError` and the `FfmpegRuntimeError` family - new typed errors. The supervisor uses `StreamingRuntimeError` for non-FFmpeg failures it surfaces (e.g. API approval). FFmpeg-specific failures use the more specific subclasses.
+- `check_cmd` (CLI) - unchanged; `run_cmd` is a sibling command, not a flag.
+
+### System interaction notes
+`upstream run` keeps the API session open for the entire stream lifetime — a real change from M3/M4 checks, which stopped the session immediately after `start_stream_session` returned. The state file is updated after each API step (agent registered, camera registered) but not after `start_stream_session` (session info is never persisted). On shutdown, the supervisor calls `stop_stream_session(session_id)` exactly once in the `_cleanup` helper. No new API endpoint is required.
+
+The redaction filter in `setup_logging` is unchanged; the supervisor's own discipline (raw SRT URL stays in one local variable, FFmpeg command is held by `FfmpegEncoderProcess` which only exposes the redacted form, all `on_event` messages contain no URL/token/streamid) does the heavy lifting.
+
+### Testing/checks
+- `pytest -q` passes (265 tests; 219 from M4 + 46 new across `test_encoder_ffmpeg.py`, `test_supervisor.py`, and 8 new CLI tests).
+- `ruff check upstream_agent tests` — 5 total warnings: the 4 baseline `B008` typer-Option-in-default false-positives (1 new for the `run` command, same pattern as the 3 existing) plus the 1 pre-existing `I001` in `tests/test_token_redaction.py`. No new lint categories.
+- `upstream --help` and `upstream run --help` render the new command cleanly.
+- **Real-backend smoke: BLOCKED.** Cannot run end-to-end against MediaMTX until `upstream-api-server` returns an SRT URL whose host/port reaches the running MediaMTX. The runtime is otherwise complete; the mocked tests cover every cleanup path. Once the API blocker is fixed, the smoke test is: configure a real token, run `upstream run`, confirm frames land in MediaMTX (visible in its own log), press Ctrl+C, confirm the agent prints the full shutdown block and exits 0.
+
+### Follow-up TODOs
+- **Real end-to-end smoke** once `upstream-api-server` returns a correct local/dev ingest host/port. This is the only remaining piece for M5 proper.
+- Milestone 6: heartbeat loop (`heartbeat/reporter.py`).
+- Milestone 7: reconnect/backoff on transient FFmpeg or API failures.
+- Possible later: `signal.signal(SIGTERM, ...)` handler. Ctrl+C → `KeyboardInterrupt` is sufficient for M5 prep; SIGTERM from systemd matters once the agent is run as a service.
+
+---
+
+## 2026-05-13 - feat: FFmpeg/SRT streaming preflight (Milestone 4)
+
+### Summary
+Milestone 4 adds `upstream check --streaming`, a local preflight that answers "is this machine ready to stream?" without actually streaming. It probes the local FFmpeg install (version, SRT protocol support, H264 encoder), reuses the existing M3 API approval flow to obtain an approved SRT URL, validates that URL, builds the FFmpeg command Milestone 5 will execute, then stops the temporary session. No frames are pushed, no long-running subprocess is started.
+
+The same milestone makes the `capabilities` payload the agent sends to `register_agent` honest. Pre-M4 it was always `{"ffmpeg": false, "srt": false}`. Post-M4, both `--api` and `--streaming` probe FFmpeg once and report `{"ffmpeg": "<version>", "srt": <bool>}` based on what the local binary actually supports.
+
+### Files touched
+- `upstream_agent/errors.py` - added `FfmpegError` family (`FfmpegNotFoundError`, `FfmpegProbeError`, `FfmpegSrtUnsupportedError`, `FfmpegH264UnsupportedError`), `SrtUrlError`, `CommandBuildError`. All inherit from `UpstreamError` so the top-level CLI catch keeps working.
+- `upstream_agent/diagnostics/ffmpeg_check.py` (new) - `FfmpegProbeResult` dataclass and `probe_ffmpeg(*, timeout_seconds=5.0, runner=None)`. Runs `ffmpeg -version` / `-protocols` / `-encoders` via one safe subprocess helper. Detects SRT with a line-boundary regex (no false match on `srtp`). Picks an H264 encoder by priority: libx264 → h264_videotoolbox → h264_nvenc → h264_qsv → h264_amf. Never raises. The `runner` kwarg lets tests stub subprocess entirely.
+- `upstream_agent/transport/__init__.py` (new), `upstream_agent/transport/srt.py` (new) - `ParsedSrtUrl` dataclass and `parse_srt_url(url)`. Validates scheme (`srt`), host, and port; raises `SrtUrlError` otherwise. Returns only safe metadata (booleans, port, mode, latency). The raw URL, hostname, and streamid never reach the dataclass.
+- `upstream_agent/encoder/__init__.py` (new), `upstream_agent/encoder/command_builder.py` (new) - `build_ffmpeg_command(...)` returns a `list[str]` ready for Milestone 5 to execute. `redact_command(cmd, srt_url)` returns a fresh list with the SRT URL replaced by `srt://<redacted>`, never mutating the input. Input handling is provisional (`-f rawvideo -pix_fmt bgr24 ... -i pipe:0`) — M5 will finalise it.
+- `upstream_agent/diagnostics/api.py` - removed the static `_AGENT_CAPABILITIES = {"ffmpeg": False, "srt": False}` constant. Added `_default_capabilities()` which probes FFmpeg lazily. Extracted `_obtain_stream_approval(cfg, state, client, capabilities, save_progress)` private helper (steps 1–3) reused by both `run_api_check` and the new streaming orchestrator. `run_api_check` now accepts an optional `capabilities` kwarg; defaults to the probed value. Public signature is backwards-compatible.
+- `upstream_agent/diagnostics/streaming.py` (new) - `StreamingCheckResult` dataclass and `run_streaming_check(cfg, state, *, client_factory=None, save_progress=None, ffmpeg_probe=None)`. Eight phases (FFmpeg → SRT support → H264 encoder → register agent → register camera → start session → SRT URL parse → command build) plus a best-effort cleanup stop. The raw SRT URL lives in a single local variable inside the function and is dropped before returning — only safe booleans cross out.
+- `upstream_agent/cli.py` - added `--streaming` flag to `check`, `_print_streaming_check_success` helper, and wiring after the `--api` block. Updated the placeholder-token gate to fire on `api OR streaming`. Updated the "no flag" hint to mention `--streaming`.
+- `tests/test_diagnostics_ffmpeg.py` (new) - 12 tests against an injected `runner`. Real `ffmpeg` is never invoked.
+- `tests/test_transport_srt.py` (new) - 14 tests. Uses placeholder URLs only; asserts `repr()` does not leak streamid or hostname.
+- `tests/test_encoder_command_builder.py` (new) - 13 tests covering shape, encoder choice, redaction, edge cases.
+- `tests/test_diagnostics_streaming.py` (new) - 14 tests against a fake API client and injected FFmpeg probe. Covers happy path, three local-failure phases (no API call fires), three API-failure phases (correct stop-or-not behaviour), SRT URL failures, command-build failure, stop-warning best-effort, leak guards on both the result and `caplog`, and capability-payload reporting from the probe.
+- `tests/test_diagnostics_api.py` - updated the capabilities test to inject a fixed dict (deterministic, no real FFmpeg dependency) and added a new test that the default capabilities come from a probed value when no kwarg is given.
+- `tests/test_cli.py` - added 9 tests for `--streaming` (no config, placeholder token, happy path, FFmpeg missing, SRT unsupported, no H264, API failure, leak guard, capabilities flow), plus a `--camera --api --streaming` ordering test.
+- `README.md` - new "Verifying streaming readiness" section with success/error examples and FFmpeg install hints for macOS / Linux / Windows. Updated the status section: M3 → done, M4 → current, M5 → live streaming.
+- `docs/architecture.md` - status table refreshed (M4 done; live streaming and frame buffer deferred to M5). New "Local preflight layer (Milestone 4)" subsection documenting the three new modules and the capabilities-reporting change.
+- `docs/module-map.md` - documented `diagnostics/ffmpeg_check.py`, `diagnostics/streaming.py`, `encoder/`, `transport/`. Updated the `diagnostics/api.py` row for the new `capabilities` kwarg and `_obtain_stream_approval` helper. Updated `errors.py` to list the new exception classes. Trimmed the "deferred submodules" table to what's still unimplemented (M5 wiring of `encoder/ffmpeg.py` and the live SRT transport).
+- `docs/api-contracts.md` - added an M4 note up top: no new endpoints; only the `capabilities` payload on `register_agent` changed. Updated the `register_agent` example payload to show `{"ffmpeg": "8.1.1", "srt": true}`.
+- `docs/troubleshooting.md` - new section with entries for FFmpeg not found, no SRT support, no H264 encoder, API failure during streaming check, invalid SRT URL, command build failure, stop warning, and the "passes but cannot stream yet" expectation.
+
+### Functions/classes changed
+- `FfmpegProbeResult` / `probe_ffmpeg()` (new) - structured outcome of the local probe; safe to log, no environment leak.
+- `ParsedSrtUrl` / `parse_srt_url()` (new) - validate and extract safe display metadata from an SRT URL.
+- `build_ffmpeg_command()` / `redact_command()` (new) - argv builder + display redactor; H264-only for M4.
+- `StreamingCheckResult` / `run_streaming_check()` (new) - eight-phase orchestrator; never raises.
+- `_default_capabilities()` (new) - lazy FFmpeg probe driving the `register_agent` capabilities payload.
+- `_obtain_stream_approval()` (new private helper) - extracted from `run_api_check`; now shared by both orchestrators. Carries the raw `StreamSessionResponse` so callers can use the SRT URL locally; callers are responsible for the cleanup stop and for dropping the response.
+- `run_api_check()` - gained an optional `capabilities` kwarg. Internal flow simplified by delegating steps 1–3 to the shared helper.
+- `check_cmd` (CLI) - gained the `--streaming` flag, the placeholder gate now covers both `api` and `streaming`.
+
+### System interaction notes
+The agent now probes FFmpeg before any API call when an API check is requested. The probe adds ~50 ms in the warm-cache case, runs three short subprocess calls, never opens a window, and reports honest capabilities to the backend. The streaming check creates and stops its own temporary session — separate from any session `--api` might have created. Running `upstream check --camera --api --streaming` will create and stop two temporary sessions back-to-back.
+
+Local state (`agent_state.json`) is unchanged: still only `agent_id`, `device_id`, `last_camera_id`. Session info, SRT URLs, and session tokens are never persisted.
+
+### Testing/checks
+- `pytest -q` passes (219 tests; 155 from M3.3 + 64 new across the four M4 test files and two updated M3 tests).
+- `ruff check upstream_agent tests` — same 4 pre-existing warnings (3 B008 typer Option defaults + 1 I001 in `tests/test_token_redaction.py`); no new lint categories.
+- Real `upstream check --streaming` smoke against the live backend, run **twice**:
+  - First run on a default Homebrew `ffmpeg` build (no libsrt): the check fails at the `srt_support` phase with the expected install hint. Useful proof that the failure path renders correctly.
+  - Second run on Homebrew `ffmpeg-full` (libsrt enabled): the check passes all eight phases — FFmpeg detected, SRT supported, libx264 picked, API approval received, SRT URL parsed, command built. The temporary session is stopped before exit. Output is the spec example block verbatim with no tokens, SRT URLs, stream IDs, or session tokens.
+
+### Follow-up TODOs
+- macOS users: document the `brew install ffmpeg-full` requirement in `README.md` and `docs/troubleshooting.md` (done — added an SRT-support entry pointing operators at `ffmpeg-full`).
+- M5 will wire the actual FFmpeg subprocess: take the `list[str]` from `build_ffmpeg_command`, launch it with a managed `subprocess.Popen`, pipe BGR frames in from `WebcamSource`, monitor exit codes, and reconnect on transient failure.
+- Once M5 lands, `encoder/__init__.py` will gain `FfmpegStreamer` (or similar) and the provisional `pipe:0` input flow may be revisited if a different source-to-FFmpeg path proves better.
+
+---
+
 ## 2026-05-12 - feat: cleanup stop session after upstream check --api (Milestone 3.3)
 
 ### Summary
