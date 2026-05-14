@@ -32,6 +32,43 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-05-14 - encoder: pin GOP to fps for snappy first-frame on join
+
+### Summary
+The H264 encoders the agent targets (libx264, h264_videotoolbox, etc.)
+default to long GOPs — libx264 is 250 frames. At 60 fps that's a ~4 s
+keyframe interval, which directly bounds how long a WebRTC reader on
+the dashboard waits for first video after the session goes live.
+Add `-g <fps>`, `-keyint_min <fps>`, and `-sc_threshold 0` to the
+ffmpeg command so the GOP is a fixed 1 s cadence regardless of encoder
+or scene-cut heuristics. First-frame latency on the dashboard drops
+from 3–4 s to ~1 s. Bitrate penalty is ~10–15% on typical
+webcam/talking-head content (more keyframes = larger frames).
+
+### Files touched
+- upstream_agent/encoder/command_builder.py — added the three flags in
+  `encode_args`. Inline comment explains why all three are needed
+  together for predictable cadence.
+- tests/test_encoder_command_builder.py — two new tests
+  (`test_keyframe_cadence_is_one_second`,
+  `test_scene_cut_keyframes_disabled`) that exercise the GOP-equals-fps
+  invariant across 15/30/60 fps and the scene-cut-disabled flag.
+
+### Testing/checks
+- `uv run pytest tests/test_encoder_command_builder.py -q` — 15 passing
+  (was 13; +2 new).
+- Live verified separately on the macbook: after rebuilding the agent
+  and restarting `upstream run`, the dashboard's first-frame time drops
+  to ~1 s with no visible quality regression.
+
+### Follow-up TODOs
+- None. If we ever target very low-bitrate scenarios (< 500 kbps)
+  where the GOP penalty starts mattering, expose a config knob like
+  `encoder.gop_seconds` so operators can trade snappy joins for lower
+  bitrate.
+
+---
+
 ## 2026-05-14 - docs: refresh srt_url example to current ingest host and streamid
 
 ### Summary

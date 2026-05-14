@@ -57,6 +57,37 @@ def test_encoder_choice_drives_c_v_arg() -> None:
     assert cmd[c_v_index + 1] == "h264_videotoolbox"
 
 
+def test_keyframe_cadence_is_one_second() -> None:
+    """GOP must equal fps so WebRTC readers see a keyframe within ~1s of join.
+
+    Without an explicit ``-g``, libx264 defaults to 250 and h264_videotoolbox
+    similar — meaning the dashboard's first-frame latency would be 4+ seconds
+    at 60 fps. Pinning the GOP to fps caps that wait at ~1s.
+    """
+    for fps in (15, 30, 60):
+        kw = _happy_kwargs()
+        kw["fps"] = fps
+        cmd = build_ffmpeg_command(**kw)
+        g_idx = cmd.index("-g")
+        assert cmd[g_idx + 1] == str(fps), (
+            f"expected -g {fps} for fps={fps}, got {cmd[g_idx + 1]}"
+        )
+        keyint_idx = cmd.index("-keyint_min")
+        assert cmd[keyint_idx + 1] == str(fps)
+
+
+def test_scene_cut_keyframes_disabled() -> None:
+    """``-sc_threshold 0`` is required for predictable GOP cadence.
+
+    Without it, libx264 will insert extra keyframes on scene cuts and the
+    GOP becomes irregular, which can defeat the WebRTC join-latency budget
+    if the encoder happens to drop a keyframe right after a reader joins.
+    """
+    cmd = build_ffmpeg_command(**_happy_kwargs())
+    sc_idx = cmd.index("-sc_threshold")
+    assert cmd[sc_idx + 1] == "0"
+
+
 def test_redact_command_replaces_srt_url_only() -> None:
     cmd = build_ffmpeg_command(**_happy_kwargs())
     redacted = redact_command(cmd, _PLACEHOLDER_SRT_URL)

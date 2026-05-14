@@ -89,6 +89,23 @@ def build_ffmpeg_command(
         "-i", "pipe:0",
     ]
 
+    # Keyframe cadence: one IDR per second.
+    #
+    # Why we set this explicitly: the H264 encoders the agent targets
+    # default to much longer GOPs (libx264 = 250 frames, h264_videotoolbox
+    # ~ 250). At 60 fps that's a ~4 s keyframe interval, which directly
+    # bounds how long a WebRTC reader has to wait for first video on the
+    # dashboard ("connecting…" then a multi-second blank period before the
+    # first frame arrives). Pinning the GOP to ``fps`` frames caps that
+    # wait at ~1 s with a modest bitrate penalty (~10–15% on typical
+    # talking-head / webcam content).
+    #
+    # ``-keyint_min`` forced equal to ``-g`` and ``-sc_threshold 0``
+    # together produce a fixed-cadence GOP: ffmpeg won't insert extra
+    # keyframes on scene cuts and won't shorten the GOP on motion. That
+    # regular cadence is what WebRTC PLI/keyframe-on-join logic relies on
+    # to predict latency.
+    gop = max(fps, 1)
     encode_args = [
         "-c:v", encoder,
         "-preset", "veryfast",
@@ -96,6 +113,9 @@ def build_ffmpeg_command(
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
         "-b:v", f"{bitrate_kbps}k",
+        "-g", str(gop),
+        "-keyint_min", str(gop),
+        "-sc_threshold", "0",
     ]
 
     output_args = ["-f", "mpegts", srt_url]
