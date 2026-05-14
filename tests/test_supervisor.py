@@ -237,6 +237,7 @@ class FakeApiClient:
             session=Session(
                 id="sess_99",
                 state="approved",
+                camera_id=req.camera_id,
                 srt_url=self._srt_url,
                 streamid=SECRET_STREAMID,
                 requested=RequestedStreamConfig(

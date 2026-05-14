@@ -37,6 +37,9 @@ from upstream_agent.api.schemas import (
     AgentRegisterResponse,
     CameraRegisterRequest,
     CameraRegisterResponse,
+    Heartbeat,
+    HeartbeatBatchRequest,
+    HeartbeatBatchResponse,
     StopStreamSessionRequest,
     StopStreamSessionResponse,
     StreamSessionRequest,
@@ -66,6 +69,8 @@ CAMERA_REGISTER_PATH: str = "/v1/cameras/register"
 STREAM_SESSION_START_PATH: str = "/v1/stream-sessions/start"
 # Path-interpolated. Build with .format(session_id=...).
 STREAM_SESSION_STOP_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}/stop"
+# Heartbeat endpoint takes ``agent_id`` as a query parameter, not a path part.
+HEARTBEAT_PATH: str = "/v1/heartbeats"
 
 # Stable error codes the backend returns inside the error envelope.
 TOKEN_REVOKED_ERROR_CODE: str = "token_revoked"
@@ -178,6 +183,27 @@ class UpstreamApiClient:
             "POST", path, StopStreamSessionRequest(), StopStreamSessionResponse
         )
 
+    def send_heartbeat(
+        self, *, agent_id: str, heartbeat: Heartbeat
+    ) -> HeartbeatBatchResponse:
+        """Submit a single-heartbeat batch for ``agent_id``.
+
+        ``agent_id`` is sent as a query parameter; the heartbeat
+        itself is wrapped in a one-item list to match the batch
+        endpoint shape. Errors are translated via the same typed
+        :class:`~upstream_agent.errors.ApiError` mapping as every
+        other endpoint.
+        """
+
+        body = HeartbeatBatchRequest(heartbeats=[heartbeat])
+        return self._request(
+            "POST",
+            HEARTBEAT_PATH,
+            body,
+            HeartbeatBatchResponse,
+            params={"agent_id": agent_id},
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -197,6 +223,8 @@ class UpstreamApiClient:
         path: str,
         body: BaseModel,
         response_model: type[T],
+        *,
+        params: dict[str, str] | None = None,
     ) -> T:
         headers = {
             **self._build_auth_header(),
@@ -205,10 +233,12 @@ class UpstreamApiClient:
         }
         payload = body.model_dump(mode="json", exclude_none=True)
 
+        request_kwargs: dict[str, Any] = {"headers": headers, "json": payload}
+        if params is not None:
+            request_kwargs["params"] = params
+
         try:
-            response = self._client.request(
-                method, path, headers=headers, json=payload
-            )
+            response = self._client.request(method, path, **request_kwargs)
         except httpx.TimeoutException as exc:
             raise ApiConnectionError(
                 f"Timed out talking to API server at {self._base_url}."

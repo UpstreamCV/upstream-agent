@@ -2,8 +2,9 @@
 
 :func:`run_agent` orchestrates the live streaming path: FFmpeg probe →
 camera open → API session approval → command build → FFmpeg start →
-frame loop → cleanup. Every cleanup path (success, FFmpeg start
-failure, mid-stream FFmpeg exit, camera read failure, Ctrl+C) stops
+heartbeat reporter start → frame loop → cleanup. Every cleanup path
+(success, FFmpeg start failure, mid-stream FFmpeg exit, camera read
+failure, fatal heartbeat error, Ctrl+C) stops the heartbeat thread,
 the FFmpeg subprocess, releases the camera, and stops the API
 session, in that order.
 
@@ -16,6 +17,8 @@ Sensitive-data discipline:
   straight into :class:`FfmpegEncoderProcess`, alongside a redacted
   copy that is the only argv the wrapper exposes via ``__repr__``
   or error messages.
+* Heartbeat payloads carry no SRT URL, streamid, or session token —
+  only IDs and runtime telemetry.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from upstream_agent.api.client import UpstreamApiClient
+from upstream_agent.api.schemas import ApprovedStreamConfig
 from upstream_agent.config import ApiConfig, CameraConfig, Config
 from upstream_agent.diagnostics import api as api_module
 from upstream_agent.diagnostics.api import _obtain_stream_approval
@@ -39,8 +43,11 @@ from upstream_agent.errors import (
     FfmpegNotFoundError,
     FfmpegSrtUnsupportedError,
 )
+from upstream_agent.heartbeat.reporter import HeartbeatReporter
+from upstream_agent.runtime.stats import RuntimeStats
 from upstream_agent.sources.base import VideoSource
 from upstream_agent.sources.webcam import WebcamSource
+from upstream_agent.version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,7 @@ ExitReason = Literal[
     "max_frames",
     "keyboard_interrupt",
     "ffmpeg_exited",
+    "fatal_heartbeat",
     "completed",
 ]
 
@@ -56,6 +64,7 @@ ExitReason = Literal[
 CameraFactory = Callable[[CameraConfig], VideoSource]
 FfmpegFactory = Callable[[list[str], list[str]], FfmpegEncoderProcess]
 EventCallback = Callable[[str, str], None]
+ReporterFactory = Callable[..., HeartbeatReporter]
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,27 @@ def _default_ffmpeg_factory(
     command: list[str], redacted_command: list[str]
 ) -> FfmpegEncoderProcess:
     return FfmpegEncoderProcess(command, redacted_command)
+
+
+def _default_reporter_factory(
+    *,
+    client: UpstreamApiClient,
+    agent_id: str,
+    camera_id: str | None,
+    session_id: str | None,
+    agent_version: str,
+    approved: ApprovedStreamConfig,
+    stats: RuntimeStats,
+) -> HeartbeatReporter:
+    return HeartbeatReporter(
+        client=client,
+        agent_id=agent_id,
+        camera_id=camera_id,
+        session_id=session_id,
+        agent_version=agent_version,
+        approved=approved,
+        stats=stats,
+    )
 
 
 def _capabilities_from(probe: FfmpegProbeResult) -> dict[str, bool | str]:
@@ -177,6 +207,7 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
     client_factory: Callable[[ApiConfig], UpstreamApiClient] | None = None,
     camera_factory: CameraFactory | None = None,
     ffmpeg_factory: FfmpegFactory | None = None,
+    reporter_factory: ReporterFactory | None = None,
     ffmpeg_probe: FfmpegProbeResult | None = None,
     save_progress: Callable[[Any], None] | None = None,
     max_frames: int | None = None,
@@ -184,18 +215,19 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
 ) -> tuple[RunResult, Any]:
     """Run the live streaming loop. Never returns while streaming.
 
-    The CLI's ``upstream run`` calls this. Tests inject the four
-    factory hooks and ``max_frames`` to drive a deterministic short
-    loop without touching real subprocesses, cameras, or HTTP.
+    The CLI's ``upstream run`` calls this. Tests inject the factory
+    hooks and ``max_frames`` to drive a deterministic short loop
+    without touching real subprocesses, cameras, or HTTP.
 
     Cleanup is performed in this order regardless of how the function
-    exits: FFmpeg → camera → API session. The function re-raises any
-    in-flight exception after cleanup runs.
+    exits: heartbeat → FFmpeg → camera → API session. The function
+    re-raises any in-flight exception after cleanup runs.
     """
 
     api_factory = client_factory or api_module._default_factory
     cam_factory = camera_factory or _default_camera_factory
     ff_factory = ffmpeg_factory or _default_ffmpeg_factory
+    hb_factory = reporter_factory or _default_reporter_factory
 
     # Phase 1: FFmpeg probe.
     probe = ffmpeg_probe if ffmpeg_probe is not None else probe_ffmpeg()
@@ -219,16 +251,19 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
     cam: VideoSource | None = None
     ffmpeg: FfmpegEncoderProcess | None = None
     client: UpstreamApiClient | None = None
+    reporter: HeartbeatReporter | None = None
     session_id: str | None = None
     frames_written: int = 0
     exit_reason: ExitReason = "completed"
     working_state = state
     client_ctx_active = False
+    stats = RuntimeStats()
 
     try:
         # Phase 2: open camera.
         cam = cam_factory(cfg.camera)
         cam.open()
+        stats.set_camera_connected(True)
         _emit(
             on_event,
             "camera_opened",
@@ -306,7 +341,30 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
         # Phase 5: FFmpeg start.
         ffmpeg = ff_factory(cmd, redacted)
         ffmpeg.start()
+        stats.set_ffmpeg_running(True)
         _emit(on_event, "ffmpeg_started", "FFmpeg started")
+
+        # Phase 5b: start heartbeat reporter. The agent_id was set on
+        # `state` by `_obtain_stream_approval`; defensively skip the
+        # reporter if it is somehow missing rather than crashing the
+        # stream.
+        agent_id = getattr(working_state, "agent_id", None)
+        if agent_id:
+            reporter = hb_factory(
+                client=client,
+                agent_id=agent_id,
+                camera_id=session_resp.session.camera_id,
+                session_id=session_id,
+                agent_version=__version__,
+                approved=approved,
+                stats=stats,
+            )
+            reporter.start()
+            _emit(on_event, "heartbeat_started", "Heartbeat reporting started")
+        else:
+            logger.warning(
+                "agent_id missing from state; heartbeat reporter not started."
+            )
 
         # Phase 6: frame loop.
         _emit(
@@ -328,6 +386,7 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
             sized = _maybe_resize(frame, target_w, target_h)
             ffmpeg.write_frame(_frame_to_bytes(sized))
             frames_written += 1
+            stats.record_frame()
 
             ffmpeg_exit = ffmpeg.poll()
             if ffmpeg_exit is not None:
@@ -335,32 +394,56 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
                     f"FFmpeg exited mid-stream with code {ffmpeg_exit}."
                 )
 
+            if reporter is not None and reporter.fatal_reason() is not None:
+                exit_reason = "fatal_heartbeat"
+                _emit(
+                    on_event,
+                    "heartbeat_fatal",
+                    f"Heartbeat reported fatal error: {reporter.fatal_reason()}",
+                )
+                break
+
             if max_frames is not None and frames_written >= max_frames:
                 exit_reason = "max_frames"
                 break
 
     except KeyboardInterrupt:
         exit_reason = "keyboard_interrupt"
+        stats.set_ffmpeg_running(False)
         _emit(on_event, "shutdown_requested", "Stopping stream...")
         # Run cleanup, then re-raise so the CLI sees the interrupt.
-        _cleanup(ffmpeg, cam, client, session_id, client_ctx_active, on_event)
+        _cleanup(
+            reporter, ffmpeg, cam, client, session_id, client_ctx_active, on_event
+        )
         raise
 
-    except FfmpegExitError:
+    except FfmpegExitError as exc:
         exit_reason = "ffmpeg_exited"
-        _cleanup(ffmpeg, cam, client, session_id, client_ctx_active, on_event)
+        stats.set_ffmpeg_running(False)
+        stats.record_error(str(exc))
+        _cleanup(
+            reporter, ffmpeg, cam, client, session_id, client_ctx_active, on_event
+        )
         raise
 
-    except Exception:
-        _cleanup(ffmpeg, cam, client, session_id, client_ctx_active, on_event)
+    except Exception as exc:
+        stats.set_ffmpeg_running(False)
+        stats.record_error(f"{exc.__class__.__name__}: {exc}")
+        _cleanup(
+            reporter, ffmpeg, cam, client, session_id, client_ctx_active, on_event
+        )
         raise
 
     # Normal exit (break out of the loop): run cleanup once.
-    _cleanup(ffmpeg, cam, client, session_id, client_ctx_active, on_event)
+    stats.set_ffmpeg_running(False)
+    _cleanup(
+        reporter, ffmpeg, cam, client, session_id, client_ctx_active, on_event
+    )
     return RunResult(frames_written=frames_written, exit_reason=exit_reason), working_state
 
 
 def _cleanup(
+    reporter: HeartbeatReporter | None,
     ffmpeg: FfmpegEncoderProcess | None,
     cam: VideoSource | None,
     client: UpstreamApiClient | None,
@@ -368,7 +451,19 @@ def _cleanup(
     client_ctx_active: bool,
     on_event: EventCallback | None,
 ) -> None:
-    """Tear down in FFmpeg → camera → session order. Never raises."""
+    """Tear down in heartbeat → FFmpeg → camera → session order.
+
+    Stopping the heartbeat first means the dashboard sees no
+    further "streaming" pings after the agent has decided to shut
+    down — even if FFmpeg teardown takes a moment. Never raises.
+    """
+
+    if reporter is not None:
+        try:
+            reporter.stop(timeout=2.0)
+        except Exception:  # pragma: no cover - stop should not raise
+            logger.exception("reporter.stop raised; continuing cleanup.")
+        _emit(on_event, "heartbeat_stopped", "Heartbeat reporting stopped")
 
     if ffmpeg is not None:
         try:

@@ -33,19 +33,20 @@ to the UpStream streaming server.
            heartbeat (status, errors, metrics) ──▶ UpStream API
 ```
 
-## What exists today (Milestones 1–5 prep)
+## What exists today (Milestones 1–6)
 
 Milestone 1 delivered the CLI, config loader, local state, and
 logging with token redaction. Milestone 2 added the camera-source
 layer and `upstream check --camera`. Milestone 3 added the HTTP
 client and `upstream check --api`. Milestone 4 added the local
 FFmpeg/SRT/H264 preflight, the SRT URL parser, the FFmpeg command
-builder, and `upstream check --streaming`. **Milestone 5** adds the
+builder, and `upstream check --streaming`. Milestone 5 adds the
 `FfmpegEncoderProcess` subprocess wrapper, the supervisor
 (`upstream_agent/supervisor.py`), and `upstream run` — the first
-command that actually streams video. `upstream run` uses the SRT
-URL returned by `/v1/stream-sessions/start` end-to-end against
-MediaMTX.
+command that actually streams video. **Milestone 6** adds the
+heartbeat loop: a background thread that POSTs runtime telemetry
+(status, fps, bitrate, resolution, last error) to
+`POST /v1/heartbeats` every 5 seconds while the stream is active.
 
 | Layer | Status |
 | --- | --- |
@@ -54,17 +55,18 @@ MediaMTX.
 | Local state (`agent_state.json` with stable `device_id`, `agent_id`, `last_camera_id`) | done |
 | Logging (rotating file + stderr, token redaction) | done |
 | Camera sources (`VideoSource` ABC + `WebcamSource`) | partial (webcam only) |
-| API client (register-agent / register-camera / start/stop-stream-session) | M3 contract confirmed; mocked tests green |
+| API client (register-agent / register-camera / start/stop-stream-session / heartbeat) | M3–M6 contract confirmed; mocked tests green |
 | Diagnostics (camera, API, streaming preflight) | done |
 | FFmpeg probe (version / SRT protocol / H264 encoder) | done |
 | SRT URL parsing/validation | done |
 | FFmpeg command builder | done |
 | Honest agent capabilities reporting via `register_agent` | done |
-| FFmpeg subprocess wrapper (`FfmpegEncoderProcess`) | done (M5 prep) |
-| Supervisor / runtime (`run_agent`) | done (M5 prep); real smoke blocked on API ingest host/port |
-| Live SRT streaming end-to-end against real MediaMTX | **gated on API fix** |
+| FFmpeg subprocess wrapper (`FfmpegEncoderProcess`) | done (M5) |
+| Supervisor / runtime (`run_agent`) | done (M5–M6) |
+| Live SRT streaming end-to-end against real MediaMTX | done (M5) |
+| Heartbeat loop + runtime health reporting | done (M6) |
 | Frame buffer | **planned** |
-| Heartbeat, reconnect/backoff, token rotation, config fetch | **planned (M6+)** |
+| Reconnect/backoff, session refresh, token rotation, config fetch | **planned (M7+)** |
 | RTSP / IP camera / file sources | **planned** |
 
 ## Camera source layer
@@ -288,6 +290,76 @@ existing `start`/`stop` pair is sufficient.
   `FfmpegWriteError`) never contain the URL; if FFmpeg echoes the
   URL in its own stderr, the wrapper scrubs any line containing
   `srt://` before quoting a short tail.
+
+## Runtime health (Milestone 6)
+
+`upstream run` now reports liveness back to the API on a 5-second
+cadence so the dashboard can mark the camera/session online and
+show basic telemetry. Two new modules implement this:
+
+- :class:`upstream_agent.runtime.stats.RuntimeStats` — a small
+  thread-safe counter object. The frame loop in
+  :func:`run_agent` calls ``record_frame`` after every successful
+  write to FFmpeg; the heartbeat thread calls ``snapshot`` once
+  per interval. The snapshot is a frozen
+  :class:`StatsSnapshot` dataclass with ``frames_written``,
+  rolling ``fps`` (computed over the last 60 frames),
+  ``camera_connected``, ``ffmpeg_running``, ``last_frame_at``,
+  and ``last_error``.
+- :class:`upstream_agent.heartbeat.reporter.HeartbeatReporter` —
+  one daemon :class:`threading.Thread`. Its loop snapshots the
+  stats, builds a :class:`Heartbeat` from the snapshot + the
+  server-approved stream config + ``__version__``, and POSTs it
+  via :meth:`UpstreamApiClient.send_heartbeat`. The reporter
+  sleeps on a :class:`threading.Event` so calling :meth:`stop`
+  wakes the thread immediately rather than waiting out the
+  interval.
+
+The heartbeat side-channel runs **alongside** the frame loop;
+neither blocks the other:
+
+```
+   Camera ──► resize ──► FFmpeg.write_frame ──► stats.record_frame
+                                                       │
+                                                       ▼
+                                              RuntimeStats (thread-safe)
+                                                       ▲
+                                                       │ snapshot()
+                                          HeartbeatReporter thread
+                                                       │
+                                                       ▼
+                                              POST /v1/heartbeats
+                                                       │
+                                                       ▼
+                                                  UpStream API
+```
+
+**Failure handling** is intentionally minimal for M6:
+
+- *Transient* failures (network blip, 5xx, 429, generic
+  :class:`ApiError`) log a warning and try again on the next
+  tick. There is no exponential backoff yet — that lands in M7.
+- *Fatal* failures (:class:`ApiTokenRevokedError`,
+  :class:`ApiTokenExpiredError`, :class:`ApiValidationError`)
+  stop the reporter thread and store a reason string. The
+  supervisor checks :meth:`HeartbeatReporter.fatal_reason` after
+  every frame; if it becomes non-``None`` the loop exits cleanly
+  with ``exit_reason="fatal_heartbeat"`` and the usual cleanup
+  chain runs.
+
+**Cleanup ordering** during shutdown is now
+heartbeat → FFmpeg → camera → API session. Stopping the
+heartbeat first means the dashboard sees no further "streaming"
+pings after the agent has decided to shut down, even if FFmpeg
+teardown takes a moment.
+
+**Sensitive-data discipline for heartbeats.** The heartbeat
+payload contains no SRT URL, streamid, or session token — only
+the camera UUID, the session UUID, an enum status, and numeric
+telemetry. The only sensitive value involved is the bearer token,
+which is attached by :meth:`UpstreamApiClient._build_auth_header`
+and never logged (the redaction filter scrubs it as a second
+line of defense).
 
 ## Design principles
 

@@ -22,6 +22,7 @@ the full request/response specification.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -265,3 +266,68 @@ class StopStreamSessionResponse(BaseModel):
     """
 
     model_config = ConfigDict(extra="ignore")
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
+
+
+HeartbeatStatus = Literal["online", "streaming", "error", "reconnecting"]
+"""The four states the backend's ``heartbeats.status`` column accepts."""
+
+
+class Heartbeat(BaseModel):
+    """One heartbeat record.
+
+    Field bounds mirror the server-side Pydantic model in
+    ``upstream-api-server`` (``schemas/heartbeats.py``). Sending a
+    value outside these bounds raises ``ValidationError`` locally so
+    the request never goes on the wire.
+
+    Sensitive fields are intentionally absent — no SRT URL, no
+    streamid, no session token. Only IDs (UUIDs as strings), status,
+    and numeric/string telemetry travel in a heartbeat.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    camera_id: str | None = None
+    session_id: str | None = None
+    status: HeartbeatStatus
+    fps: float | None = Field(default=None, ge=0, le=1000)
+    bitrate_kbps: int | None = Field(default=None, ge=0, le=200_000)
+    width: int | None = Field(default=None, ge=1, le=7680)
+    height: int | None = Field(default=None, ge=1, le=4320)
+    codec: str | None = Field(default=None, max_length=32)
+    last_error: str | None = Field(default=None, max_length=512)
+    agent_version: str | None = Field(default=None, max_length=64)
+    reported_at: datetime
+
+
+class HeartbeatBatchRequest(BaseModel):
+    """Body of ``POST /v1/heartbeats?agent_id=<uuid>``.
+
+    The endpoint accepts 1–100 heartbeats per call; M6 sends one at a
+    time. Batching across cameras or queued offline heartbeats is
+    deferred to the M7 reconnect work.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    heartbeats: list[Heartbeat] = Field(min_length=1, max_length=100)
+
+
+class HeartbeatBatchResponse(BaseModel):
+    """Server response for a heartbeat batch.
+
+    ``accepted`` may be lower than the number sent if individual
+    items failed server-side validation. The endpoint does not return
+    a ``next_interval_s`` or any stop/control directive — the agent
+    picks its own cadence.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    accepted: int
+    server_time: str | None = None

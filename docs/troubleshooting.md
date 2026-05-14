@@ -486,6 +486,74 @@ API-issued SRT URL; the previous temporary local-dev SRT URL
 override was removed after real API-issued streaming was verified
 end-to-end.
 
+## Heartbeat / dashboard offline (`upstream run`)
+
+While `upstream run` is active, a background thread POSTs a
+heartbeat to `POST /v1/heartbeats` every 5 seconds. The dashboard
+uses those to mark the camera/session online and surface basic
+runtime telemetry (fps, bitrate, resolution, last error).
+
+### Dashboard shows the camera offline but `upstream run` is still streaming
+
+Check `~/.upstream/logs/agent.log` for `Heartbeat send failed
+(transient): ...` lines. Common causes:
+
+- **API unreachable from the agent host** — network blip, DNS,
+  proxy. The agent will keep retrying on the next 5-second tick.
+  Run `upstream check --api` in a second terminal to confirm
+  baseline connectivity.
+- **API server slow / 5xx** — the warning carries the `code=` and
+  `request_id=` from the server response; share those with
+  support.
+- **Clock skew** — heartbeat `reported_at` is in UTC and the
+  server response includes its own `server_time`; large skew can
+  confuse the dashboard's "online" window.
+
+The stream itself is not affected — heartbeat failures are
+non-fatal by default.
+
+### `upstream run` exits with `exit_reason=fatal_heartbeat`
+
+The heartbeat endpoint returned a clearly-fatal error and the
+runtime shut down cleanly. The CLI log line above the exit will
+identify which:
+
+- `ApiTokenRevokedError` — token was revoked server-side.
+  Generate a new token from the dashboard and rewrite
+  `api.token` in `~/.upstream/config.yaml`.
+- `ApiTokenExpiredError` — token expired. Same fix.
+- `ApiValidationError` — usually `403 forbidden_resource` (the
+  `camera_id` or `session_id` in the heartbeat is not owned by
+  this agent, e.g. the camera was deleted from the dashboard
+  mid-stream) or `422 validation_error` (agent bug — please
+  report). Re-running after the token / camera issue is fixed
+  picks up cleanly.
+
+### Heartbeat send succeeds but the dashboard still shows offline
+
+Confirm the `agent_id` query parameter matches the registered
+agent by inspecting recent heartbeats via the API directly:
+
+```
+curl -H "Authorization: Bearer <token>" \
+  https://api.upstreamcv.com/v1/agents/<agent_id>/heartbeats?limit=5
+```
+
+A non-empty list with `reported_at` advancing every ~5 seconds
+means the agent side is working — the dashboard's stale-time
+window may simply not have refreshed yet, or its threshold for
+"online" is longer than 5 seconds.
+
+### `agent_id missing from state; heartbeat reporter not started.`
+
+Defensive log line emitted when `state.agent_id` is `None` at the
+point the supervisor is about to start the heartbeat thread. In
+normal operation `_obtain_stream_approval` sets `agent_id` during
+registration; if you see this, your local
+`~/.upstream/agent_state.json` may have been deleted between
+registration and the streaming phase. Delete the state file
+entirely and re-run — the agent will register fresh.
+
 ## Installation
 
 ### `pip install -e .` fails on Python 3.9 or older

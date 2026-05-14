@@ -32,6 +32,14 @@ reflect what the API team has settled on.
 > port doesn't reach the running MediaMTX; the agent's runtime is
 > otherwise complete and gates the real end-to-end smoke on this
 > being fixed server-side.
+>
+> **Milestone 6 update:** one new endpoint —
+> `POST /v1/heartbeats?agent_id=<uuid>`. While `upstream run` is
+> streaming, a background thread POSTs a heartbeat every 5 seconds
+> so the API can mark the camera/session online and surface basic
+> runtime telemetry. The heartbeat carries no SRT URL, streamid, or
+> session token. See the new section below for the confirmed
+> contract.
 
 ## Base URLs
 
@@ -291,6 +299,96 @@ approval work. If the subsequent stop call fails, the operator sees
 a warning line on stderr but `upstream check --api` still exits 0
 and the success block prints normally. The session will eventually
 expire server-side regardless.
+
+### `POST /v1/heartbeats`
+
+Submit a batch of heartbeats for an agent. Called by `upstream run`
+on a 5-second cadence from a background thread while the stream is
+active. The agent sends one heartbeat per call in Milestone 6;
+batching across multiple cameras or replaying offline-queued
+heartbeats is deferred to the M7 reconnect work.
+
+**Query parameter:** `agent_id` — the UUID of the agent (under the
+calling account's token). Cameras and sessions referenced in the
+batch must belong to that agent.
+
+**Request body**
+
+```json
+{
+  "heartbeats": [
+    {
+      "camera_id": "9c8c7e3e-c1a6-4d6c-bdda-b8c0f5a3d211",
+      "session_id": "2b6f0ad4-e7c4-4d61-aa1e-a8d4c47e9b22",
+      "status": "streaming",
+      "fps": 29.97,
+      "bitrate_kbps": 3000,
+      "width": 1280,
+      "height": 720,
+      "codec": "h264",
+      "last_error": null,
+      "agent_version": "0.1.0",
+      "reported_at": "2026-05-13T12:00:00Z"
+    }
+  ]
+}
+```
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `heartbeats` | yes | 1–100 items per call. M6 sends one at a time. |
+| `camera_id` | no | UUID; must belong to this agent. |
+| `session_id` | no | UUID; must belong to this agent. |
+| `status` | yes | Exactly one of `"online"`, `"streaming"`, `"error"`, `"reconnecting"`. The agent sends `"streaming"` while FFmpeg is running and frames are flowing. |
+| `fps` | no | Float, 0..1000. Computed over a sliding 60-frame window. |
+| `bitrate_kbps` | no | Int, 0..200000. The server-approved bitrate. |
+| `width`, `height` | no | Int, 1..7680 / 1..4320. The server-approved resolution. |
+| `codec` | no | String, max 32 chars. |
+| `last_error` | no | String, max 512 chars. The most recent error the runtime saw, if any. |
+| `agent_version` | no | String, max 64 chars. `upstream_agent.__version__`. |
+| `reported_at` | yes | ISO 8601 with timezone. The agent emits UTC. |
+
+**Response 200**
+
+```json
+{
+  "accepted": 1,
+  "server_time": "2026-05-13T12:00:01Z"
+}
+```
+
+`accepted` is the number of items the server actually inserted (≤
+the request count if individual items failed validation). The
+endpoint does **not** return a `next_interval_s` directive or any
+stop/control flag — the agent picks its own cadence.
+
+**Server-side side effects.** On a successful batch the server:
+
+1. Inserts one row per heartbeat into the `heartbeats` table.
+2. Updates `agents.last_seen_at = now()` for the agent_id.
+3. Updates `cameras.updated_at = now()` for each referenced camera.
+4. Records a `usage_events` row (`event_type="heartbeat_batch"`).
+
+**Error responses**
+
+| HTTP status | Code | Notes |
+| --- | --- | --- |
+| 401 | `token_revoked` | Fatal. The reporter stops and the supervisor exits the run with `exit_reason="fatal_heartbeat"`. |
+| 401 | `token_expired` | Fatal. Same handling as `token_revoked`. |
+| 403 | `forbidden_resource` | `camera_id` or `session_id` in the batch is not owned by this agent. `details.missing_camera_ids` / `missing_session_ids` lists which. Mapped to `ApiAuthError`; treated as fatal. |
+| 422 | `validation_error` | Body failed Pydantic validation. Mapped to `ApiValidationError`; treated as fatal. |
+| 429, 5xx, network | various | Transient. The reporter logs a warning and tries again next tick. M7 will add backoff. |
+
+**Related read endpoints** (used by the dashboard, not the agent):
+
+- `GET /v1/agents/{agent_id}/heartbeats?limit=&before=` — agent
+  heartbeat history, newest first.
+- `GET /v1/cameras/{camera_id}/heartbeats?limit=&before=` — camera
+  heartbeat history. Same shape.
+
+The contract here matches the upstream-api-server implementation
+verbatim — see `src/upstream_api/routers/heartbeats.py` and
+`src/upstream_api/schemas/heartbeats.py` in that repo.
 
 ## Error envelope
 
