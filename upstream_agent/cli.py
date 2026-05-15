@@ -34,6 +34,7 @@ from pathlib import Path
 
 import typer
 
+from upstream_agent.branding import maybe_print_welcome
 from upstream_agent.config import (
     Config,
     load_config,
@@ -77,6 +78,11 @@ def _main(
     ),
 ) -> None:
     """UpStream agent CLI."""
+
+
+def main() -> None:
+    maybe_print_welcome()
+    app()
 
 
 def _default_log_dir() -> Path:

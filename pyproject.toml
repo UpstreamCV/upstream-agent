@@ -38,7 +38,7 @@ dev = [
 ]
 
 [project.scripts]
-upstream = "upstream_agent.cli:app"
+upstream = "upstream_agent.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/UpstreamCV/upstream-agent"
