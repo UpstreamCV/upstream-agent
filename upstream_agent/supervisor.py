@@ -51,13 +51,16 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from upstream_agent.api.client import UpstreamApiClient
 from upstream_agent.api.schemas import (
     AgentRegisterRequest,
     ApprovedStreamConfig,
+    BootstrapLimits,
     CameraRegisterRequest,
+    Heartbeat,
     RequestedStreamConfig,
     StreamSessionRequest,
     StreamSessionResponse,
@@ -98,6 +101,7 @@ from upstream_agent.errors import (
     StreamingRuntimeError,
 )
 from upstream_agent.heartbeat.reporter import HeartbeatReporter
+from upstream_agent.preflight import PlannedStreamConfig, plan_stream_config
 from upstream_agent.runtime.backoff import BackoffPolicy
 from upstream_agent.runtime.stats import RuntimeStats
 from upstream_agent.sources.base import VideoSource
@@ -419,6 +423,7 @@ def _register_if_needed(
     client: UpstreamApiClient,
     capabilities: dict[str, bool | str],
     save_progress: Callable[[Any], None] | None,
+    planned: PlannedStreamConfig | None = None,
 ) -> Any:
     """Idempotently register agent + camera; return updated state.
 
@@ -448,16 +453,22 @@ def _register_if_needed(
             save_progress(working_state)
 
     if getattr(working_state, "last_camera_id", None) is None:
+        # Register with the planned (pre-clamped) defaults when a plan is
+        # available so registration can't trip the server's limit checks
+        # on a config the session start would clamp anyway.
         camera_req = CameraRegisterRequest(
             agent_id=working_state.agent_id,
             name=cfg.camera.name,
             external_id=_camera_external_id(cfg.camera),
             device_path=_camera_device_path(cfg.camera),
-            default_width=cfg.camera.requested_width,
-            default_height=cfg.camera.requested_height,
-            default_fps=cfg.camera.requested_fps,
-            default_codec=_DEFAULT_CODEC,
-            default_bitrate_kbps=_DEFAULT_BITRATE_KBPS,
+            source_type=cfg.camera.source_type,
+            default_width=planned.width if planned else cfg.camera.requested_width,
+            default_height=planned.height if planned else cfg.camera.requested_height,
+            default_fps=planned.fps if planned else cfg.camera.requested_fps,
+            default_codec=planned.codec if planned else _DEFAULT_CODEC,
+            default_bitrate_kbps=(
+                planned.bitrate_kbps if planned else _DEFAULT_BITRATE_KBPS
+            ),
             default_latency_mode=cfg.stream.latency_mode,
             metadata={},
         )
@@ -472,22 +483,85 @@ def _register_if_needed(
 
 
 def _start_session(
-    *, cfg: Config, camera_id: str, client: UpstreamApiClient
+    *,
+    cfg: Config,
+    camera_id: str,
+    client: UpstreamApiClient,
+    planned: PlannedStreamConfig | None = None,
 ) -> StreamSessionResponse:
-    """Request a fresh stream session for ``camera_id``."""
+    """Request a fresh stream session for ``camera_id``.
+
+    When a :class:`PlannedStreamConfig` is provided (limits pre-check ran),
+    its clamped values are requested instead of the raw local config —
+    the server still validates and remains the enforcement point.
+    """
 
     session_req = StreamSessionRequest(
         camera_id=camera_id,
         requested=RequestedStreamConfig(
-            width=cfg.camera.requested_width,
-            height=cfg.camera.requested_height,
-            fps=cfg.camera.requested_fps,
-            codec=_DEFAULT_CODEC,
-            bitrate_kbps=_DEFAULT_BITRATE_KBPS,
+            width=planned.width if planned else cfg.camera.requested_width,
+            height=planned.height if planned else cfg.camera.requested_height,
+            fps=planned.fps if planned else cfg.camera.requested_fps,
+            codec=planned.codec if planned else _DEFAULT_CODEC,
+            bitrate_kbps=planned.bitrate_kbps if planned else _DEFAULT_BITRATE_KBPS,
             latency_mode=cfg.stream.latency_mode,
         ),
     )
     return client.start_stream_session(session_req)
+
+
+def _fetch_limits(
+    client: UpstreamApiClient, on_event: EventCallback | None
+) -> BootstrapLimits | None:
+    """Best-effort bootstrap limits fetch. Never raises.
+
+    ``None`` means "limits unknown" — the pre-check passes the local
+    config through and the server enforces, exactly as before bootstrap
+    existed.
+    """
+
+    try:
+        boot = client.get_bootstrap()
+    except ApiError as exc:
+        _emit(
+            on_event,
+            "bootstrap_unavailable",
+            "Could not fetch account limits (pre-check skipped; the server "
+            f"still enforces them): {_safe_message(exc)}",
+        )
+        return None
+    return boot.limits
+
+
+def _report_blocked_by_limits(
+    client: UpstreamApiClient,
+    *,
+    agent_id: str | None,
+    camera_id: str | None,
+    message: str,
+) -> None:
+    """Best-effort one-shot heartbeat marking this agent limit-blocked.
+
+    Lets the dashboard distinguish "agent is broken" from "agent is fine
+    but the account is at capacity". Never raises; never carries secrets.
+    """
+
+    if not agent_id:
+        return
+    try:
+        client.send_heartbeat(
+            agent_id=agent_id,
+            heartbeat=Heartbeat(
+                camera_id=camera_id,
+                session_id=None,
+                status="error",
+                last_error=f"blocked by limits: {message}"[:512],
+                agent_version=__version__,
+                reported_at=datetime.now(tz=timezone.utc),
+            ),
+        )
+    except Exception:
+        logger.debug("blocked-by-limits heartbeat failed; ignoring.")
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +975,7 @@ def _run_attempt(
     probe: FfmpegProbeResult,
     save_progress: Callable[[Any], None] | None,
     max_frames: int | None,
+    planned: PlannedStreamConfig | None = None,
     ingest_timeout_s: float = _INGEST_CONFIRM_TIMEOUT_S,
     ingest_poll_interval_s: float = _INGEST_POLL_INTERVAL_S,
 ) -> tuple[_AttemptOutcome, Any]:
@@ -929,6 +1004,7 @@ def _run_attempt(
             client=client,
             capabilities=capabilities,
             save_progress=save_progress,
+            planned=planned,
         )
         camera_id = working_state.last_camera_id
         if camera_id is None:
@@ -939,7 +1015,9 @@ def _run_attempt(
             )
 
         # ---- request a fresh stream session ----
-        session_resp = _start_session(cfg=cfg, camera_id=camera_id, client=client)
+        session_resp = _start_session(
+            cfg=cfg, camera_id=camera_id, client=client, planned=planned
+        )
         session_id = session_resp.session.id
         approved = session_resp.session.approved
         if approved is None:
@@ -961,6 +1039,20 @@ def _run_attempt(
                 f"Approved config: {approved.codec}, "
                 f"{approved.width}x{approved.height} @ {approved.fps} FPS, "
                 f"{approved.bitrate_kbps} kbps, {approved.latency_mode}"
+            ),
+        )
+        # Requested-vs-approved decision line. "Requested" is what the
+        # local config asked for; "Approved" is what the server signed
+        # off on (post pre-clamp). Identical values still get the line —
+        # it documents that the server is the source of truth.
+        _emit(
+            on_event,
+            "config_decision",
+            (
+                f"Requested: {cfg.camera.requested_width}x"
+                f"{cfg.camera.requested_height} @ {cfg.camera.requested_fps}fps / "
+                f"Approved: {approved.width}x{approved.height} @ {approved.fps}fps / "
+                "Action: using server-approved config"
             ),
         )
 
@@ -1124,6 +1216,23 @@ def _run_attempt(
         outcome_kind = kind
         outcome_error = exc
         outcome_message = _safe_message(exc)
+        if (
+            isinstance(exc, ApiValidationError)
+            and "limit_exceeded" in str(exc)
+        ):
+            _emit(
+                on_event,
+                "limits_rejected",
+                "Server rejected the stream request due to account limits: "
+                f"{outcome_message}. Check your account's caps with "
+                "'upstream' (limits) or ask an account owner to raise them.",
+            )
+            _report_blocked_by_limits(
+                client,
+                agent_id=getattr(working_state, "agent_id", None),
+                camera_id=getattr(working_state, "last_camera_id", None),
+                message=outcome_message,
+            )
         if kind == "fatal":
             logger.error("Fatal error during streaming attempt: %s", outcome_message)
         else:
@@ -1200,6 +1309,7 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
     camera_release_settle_s: float = _CAMERA_RELEASE_SETTLE_S,
     camera_unavailable_hint_after: int = _CAMERA_UNAVAILABLE_HINT_AFTER,
     on_event: EventCallback | None = None,
+    shutdown: threading.Event | None = None,
 ) -> tuple[RunResult, Any]:
     """Run the live streaming loop with automatic recovery on transient failures.
 
@@ -1248,7 +1358,10 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
     client: UpstreamApiClient | None = None
     client_ctx_active = False
     stats = RuntimeStats()
-    shutdown = threading.Event()
+    # An externally supplied Event lets a host (the interactive shell)
+    # stop this run from another thread; standalone callers get a
+    # private one and stop via Ctrl+C exactly as before.
+    shutdown = shutdown if shutdown is not None else threading.Event()
     total_frames = 0
     working_state = state
     exit_reason: ExitReason = "completed"
@@ -1270,6 +1383,31 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
         client = api_factory(cfg.api)
         client.__enter__()
         client_ctx_active = True
+
+        # Phase 3.5: limits pre-check. Best-effort bootstrap fetch, then
+        # clamp the local request to the account's caps so the session
+        # start asks for something the server will approve. PreflightError
+        # (disallowed source type / codec — nothing to clamp to) is fatal
+        # and propagates after cleanup. The server re-validates everything
+        # regardless; this just fails earlier with a friendlier message.
+        limits = _fetch_limits(client, on_event)
+        planned = plan_stream_config(
+            width=cfg.camera.requested_width,
+            height=cfg.camera.requested_height,
+            fps=cfg.camera.requested_fps,
+            codec=_DEFAULT_CODEC,
+            bitrate_kbps=_DEFAULT_BITRATE_KBPS,
+            latency_mode=cfg.stream.latency_mode,
+            limits=limits,
+            source_type=cfg.camera.source_type,
+        )
+        if planned.was_adjusted:
+            _emit(
+                on_event,
+                "limits_precheck",
+                "Account limits require adjustment: "
+                + "; ".join(planned.adjustments),
+            )
 
         # Phase 4: recovery loop.
         attempts_started = 0
@@ -1297,6 +1435,7 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
                 probe=probe,
                 save_progress=save_progress,
                 max_frames=max_frames,
+                planned=planned,
                 ingest_timeout_s=ingest_timeout_s,
                 ingest_poll_interval_s=ingest_poll_interval_s,
             )

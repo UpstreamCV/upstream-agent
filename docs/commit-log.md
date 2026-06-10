@@ -182,6 +182,70 @@ in detail in `architecture.md` "Honest gaps and planned work
 
 ---
 
+## 2026-06-10 - feat: interactive `upstream` shell + server-controlled stream config (smart flow)
+
+### Summary
+Two layers. **Smart flow:** the client gains `get_bootstrap()` /
+`claim_camera()`; `run_agent` fetches account limits once per run (best
+effort — older servers 404 and the pre-check is skipped) and
+`preflight.plan_stream_config` clamps requested
+width/height/fps/bitrate to those caps before the session request,
+emitting `limits_precheck` and a `Requested/Approved/Action` decision
+line. Disallowed codec/source-type raise `PreflightError` early; camera
+registration now sends `source_type`. A `limit_exceeded.*` rejection
+emits `limits_rejected` and one best-effort blocked-by-limits heartbeat
+(`status="error"`, `last_error="blocked by limits: …"`). The server
+stays the enforcement point throughout. **Interactive mode:** bare
+`upstream` opens a REPL (`interactive/shell.py`) — `login` reads the
+token hidden, verifies via bootstrap before `config.save_api_token`
+persists it; status/account/limits/cameras/streams render from cached
+bootstrap; `start` claims a dashboard-created camera, builds its
+CameraConfig from the server record (`server_config.py`), and streams on
+a background `StreamWorker` thread (`run_agent` gains an optional
+external `shutdown` Event); logs go to a redaction-filtered
+`RingBufferHandler` + file (`setup_logging(console=False,
+extra_handlers=…)`) so nothing scrolls over the prompt.
+
+### Files touched
+- `api/schemas.py`, `api/client.py` — bootstrap/claim models + methods;
+  `CameraRegisterRequest.source_type`.
+- `preflight.py`, `server_config.py`, `interactive/` (worker.py,
+  shell.py) — new.
+- `supervisor.py` — bootstrap fetch, planned-config threading, decision
+  line, blocked-by-limits heartbeat, external shutdown param.
+- `logging_setup.py` — RingBufferHandler, console/extra_handlers opts.
+- `config.py` — save_api_token (YAML-preserving; drops template
+  comments). `errors.py` — PreflightError. `cli.py` — no-args callback
+  launches the shell. `diagnostics/api.py` — source_type.
+- Tests: 6 new files (preflight, api bootstrap, supervisor precheck,
+  log buffer, worker, shell) + source_type/bootstrap-fake updates.
+- README.md, docs/api-contracts.md, docs/architecture.md.
+
+### Functions/classes changed
+- `run_agent(..., shutdown: threading.Event | None = None)` — external
+  Event lets a host thread stop the run; default behavior unchanged.
+- `StreamWorker`/`WorkerRegistry` — name-keyed, N-ready for the
+  multi-camera follow-up (upstream-agent#2).
+- `InteractiveShell` — fully injectable (input_fn/password_fn/
+  client_factory/run_fn/Console) for TTY-free tests.
+
+### System interaction notes
+Behavior change: bare `upstream` opens the shell instead of printing
+help (with piped/closed stdin it EOFs and exits 0, so automation can't
+hang). New agent vs old server degrades cleanly (bootstrap 404 →
+pre-check skipped). Token never echoed/logged — redaction filter applies
+to the ring buffer like every handler.
+
+### Testing/checks
+- `pytest` — 413 passed (46 new). Manual smoke in an isolated $HOME:
+  shell opens, help/status render, quit exits 0.
+
+### Follow-up TODOs
+- RTSP capture is still a stub; shell surfaces an honest error for rtsp
+  cameras until upstream-agent#8 lands.
+- Shell-path agent registration sends empty capabilities (refreshed on
+  the next supervisor registration).
+
 ## 2026-05-14 - cleanup: honest recovery logging + macOS camera limitation
 
 ### Summary

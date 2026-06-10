@@ -47,6 +47,32 @@ def test_version_flag_prints_version() -> None:
     assert __version__ in result.stdout
 
 
+def test_bare_invocation_launches_interactive_shell(monkeypatch) -> None:
+    import upstream_agent.cli as cli_module
+
+    calls: list[object] = []
+
+    def fake_launch(config: object) -> int:
+        calls.append(config)
+        return 0
+
+    monkeypatch.setattr(cli_module, "_launch_interactive", fake_launch)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 0
+    assert calls == [None]
+
+
+def test_subcommands_bypass_interactive_shell(monkeypatch) -> None:
+    import upstream_agent.cli as cli_module
+
+    def fail_launch(config: object) -> int:
+        raise AssertionError("interactive shell must not launch for subcommands")
+
+    monkeypatch.setattr(cli_module, "_launch_interactive", fail_launch)
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+
+
 # ---------------------------------------------------------------------------
 # upstream init
 # ---------------------------------------------------------------------------

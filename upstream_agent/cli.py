@@ -55,8 +55,7 @@ from upstream_agent.version import __version__
 
 app = typer.Typer(
     name="upstream",
-    help="UpStream agent CLI.",
-    no_args_is_help=True,
+    help="UpStream agent CLI. Run with no arguments for interactive mode.",
     add_completion=False,
 )
 
@@ -67,8 +66,9 @@ def _print_version(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def _main(
+    ctx: typer.Context,
     version: bool = typer.Option(  # noqa: ARG001  (used via callback)
         False,
         "--version",
@@ -76,8 +76,52 @@ def _main(
         is_eager=True,
         help="Show version and exit.",
     ),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Override the config file path (interactive mode only).",
+    ),
 ) -> None:
-    """UpStream agent CLI."""
+    """UpStream agent CLI.
+
+    With no subcommand, opens the interactive terminal: account status,
+    cameras, stream start/stop, and logs in one live session.
+    """
+
+    if ctx.invoked_subcommand is not None:
+        return
+    raise typer.Exit(code=_launch_interactive(config))
+
+
+def _launch_interactive(config: Path | None) -> int:
+    """Start the interactive shell with ring-buffered logging.
+
+    The stderr log handler is disabled so background stream workers
+    can't scroll log lines over the prompt; logs go to the rotating
+    file and the in-memory ring buffer (the shell's ``logs`` command).
+    """
+
+    # Imported lazily: the interactive module pulls in Rich and the
+    # supervisor stack, which subcommands like `upstream init` never need.
+    from upstream_agent.interactive.shell import InteractiveShell  # noqa: PLC0415
+    from upstream_agent.logging_setup import RingBufferHandler  # noqa: PLC0415
+
+    level = "info"
+    sensitive: tuple[str, ...] = ()
+    try:
+        cfg = load_config(config, allow_placeholder=True)
+        level = cfg.logging.level
+        if not cfg.api.is_placeholder_token:
+            sensitive = (cfg.api.token,)
+    except UpstreamError:
+        # No config yet — the shell opens in "not configured" mode and
+        # offers `login`.
+        pass
+
+    ring = RingBufferHandler()
+    setup_logging(level, sensitive_values=sensitive, console=False, extra_handlers=(ring,))
+    shell = InteractiveShell(config_path=config, ring=ring)
+    return shell.run()
 
 
 def main() -> None:

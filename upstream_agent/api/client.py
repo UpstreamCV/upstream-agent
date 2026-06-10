@@ -35,6 +35,9 @@ from pydantic import BaseModel, ValidationError
 from upstream_agent.api.schemas import (
     AgentRegisterRequest,
     AgentRegisterResponse,
+    BootstrapResponse,
+    CameraClaimRequest,
+    CameraClaimResponse,
     CameraRegisterRequest,
     CameraRegisterResponse,
     Heartbeat,
@@ -66,7 +69,12 @@ logger = logging.getLogger(__name__)
 
 # Endpoint paths — CONFIRMED contract. See docs/api-contracts.md.
 AGENT_REGISTER_PATH: str = "/v1/agents/register"
+# Server-side context for this token's account: account/limits/usage/
+# cameras/active sessions. The response never carries secrets.
+AGENT_BOOTSTRAP_PATH: str = "/v1/agents/bootstrap"
 CAMERA_REGISTER_PATH: str = "/v1/cameras/register"
+# Path-interpolated. Assigns a dashboard-created camera to this agent.
+CAMERA_CLAIM_PATH_TEMPLATE: str = "/v1/cameras/{camera_id}/claim"
 STREAM_SESSION_START_PATH: str = "/v1/stream-sessions/start"
 # Path-interpolated. Build with .format(session_id=...).
 STREAM_SESSION_STOP_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}/stop"
@@ -159,9 +167,36 @@ class UpstreamApiClient:
             "POST", AGENT_REGISTER_PATH, req, AgentRegisterResponse
         )
 
+    def get_bootstrap(self) -> BootstrapResponse:
+        """Fetch the server-side context for this token's account.
+
+        One call answers: which account this token belongs to, what
+        limits apply, which cameras exist (with their server-controlled
+        config), what sessions are active, and current usage. The
+        response carries no secrets. Servers that predate the endpoint
+        return 404, which surfaces as :class:`ApiValidationError` —
+        callers treat that as "bootstrap unavailable" and degrade
+        gracefully.
+        """
+
+        return self._request("GET", AGENT_BOOTSTRAP_PATH, None, BootstrapResponse)
+
     def register_camera(self, req: CameraRegisterRequest) -> CameraRegisterResponse:
         return self._request(
             "POST", CAMERA_REGISTER_PATH, req, CameraRegisterResponse
+        )
+
+    def claim_camera(self, *, camera_id: str, agent_id: str) -> CameraClaimResponse:
+        """Claim a dashboard-created (unassigned) camera for this agent.
+
+        Idempotent when the camera is already held by ``agent_id``. A
+        camera held by a different agent surfaces as
+        :class:`ApiValidationError` (409 ``camera_claimed_by_other_agent``).
+        """
+
+        path = CAMERA_CLAIM_PATH_TEMPLATE.format(camera_id=camera_id)
+        return self._request(
+            "POST", path, CameraClaimRequest(agent_id=agent_id), CameraClaimResponse
         )
 
     def start_stream_session(

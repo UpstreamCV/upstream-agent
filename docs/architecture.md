@@ -589,3 +589,42 @@ of improvements to streaming continuity and contract honesty.
 4. **Errors are typed.** All package errors inherit from
    `UpstreamError`; the CLI catches that one type at the top level and
    exits non-zero with a clean stderr message.
+
+## Interactive mode + server-controlled config (smart flow)
+
+Bare `upstream` opens `upstream_agent/interactive/shell.py::InteractiveShell`,
+a line-oriented REPL. Module map:
+
+- `interactive/shell.py` — REPL: `login` (hidden token prompt, verified
+  against `GET /v1/agents/bootstrap` before `config.save_api_token`
+  persists it), `status`/`account`/`limits`/`cameras`/`streams` rendered
+  from the cached `BootstrapResponse`, `start`/`stop`, `logs`,
+  `refresh`. Disconnects flip a "disconnected" flag; `refresh` retries;
+  workers keep their own recovery loops.
+- `interactive/worker.py` — `StreamWorker`: one `run_agent` call on a
+  daemon thread, stopped via the supervisor's external `shutdown` Event
+  (new optional `run_agent(..., shutdown=…)` parameter; standalone
+  `upstream run` is unchanged). Supervisor `on_event` messages are
+  logged — not printed — so they land in the ring buffer and the file.
+  `WorkerRegistry` is name-keyed and N-ready (multi-camera is
+  upstream-agent#2).
+- `logging_setup.py::RingBufferHandler` + `setup_logging(console=False,
+  extra_handlers=…)` — interactive mode disables the stderr handler so
+  logs never scroll over the prompt; the redaction filter applies to the
+  ring buffer like every other handler.
+- `preflight.py` — local pre-check after bootstrap: clamps requested
+  width/height/fps/bitrate to account limits (`limits_precheck` event),
+  raises `PreflightError` for disallowed codec/source-type. Convenience
+  only; the server re-validates everything.
+- `server_config.py` — maps a server camera record (`device_path`
+  convention `webcam:<index>` / `rtsp:<url>` + `default_*`) onto the
+  local `CameraConfig`, so dashboard-configured cameras stream without a
+  local YAML camera section. The local `camera:` section remains as a
+  fallback when the account has no server cameras, and `upstream run` /
+  `upstream check` still use it directly.
+
+Start flow for a dashboard-created camera: ensure agent registered →
+`POST /v1/cameras/{id}/claim` → build `CameraConfig` from the server
+record → spawn `StreamWorker` → prompt returns immediately. Server
+rejections (`limit_exceeded.*`) render in the shell, mark the worker
+`error`, and fire one blocked-by-limits heartbeat.

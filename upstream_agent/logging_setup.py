@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Iterable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -68,6 +69,45 @@ def redact_token(token: str | None) -> str:
     return f"****{token[-4:]}"
 
 
+class RingBufferHandler(logging.Handler):
+    """In-memory log handler backing the interactive shell's ``logs`` view.
+
+    Keeps the last ``capacity`` formatted records in a deque so log
+    output never spams the interactive terminal; the shell renders
+    :meth:`tail` on demand. Attach via ``setup_logging(extra_handlers=...)``
+    so it gets the shared :class:`TokenRedactionFilter` like every other
+    handler.
+    """
+
+    def __init__(self, capacity: int = 500) -> None:
+        super().__init__()
+        from collections import deque  # noqa: PLC0415 - tiny, local
+
+        self._records: deque[str] = deque(maxlen=capacity)
+        self._records_lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+        except Exception:  # pragma: no cover - formatting must never raise
+            line = str(record.msg)
+        with self._records_lock:
+            self._records.append(line)
+
+    def tail(self, n: int = 50) -> list[str]:
+        """Return the most recent ``n`` formatted log lines, oldest first."""
+
+        with self._records_lock:
+            lines = list(self._records)
+        if n <= 0:
+            return []
+        return lines[-n:]
+
+    def __len__(self) -> int:
+        with self._records_lock:
+            return len(self._records)
+
+
 class TokenRedactionFilter(logging.Filter):
     """Logging filter that scrubs known secrets and token-shaped patterns.
 
@@ -102,6 +142,9 @@ def setup_logging(
     level: str = "info",
     log_dir: Path = DEFAULT_LOG_DIR,
     sensitive_values: Iterable[str] = (),
+    *,
+    console: bool = True,
+    extra_handlers: Iterable[logging.Handler] = (),
 ) -> None:
     """Configure root logging for the agent.
 
@@ -110,6 +153,12 @@ def setup_logging(
     a :class:`TokenRedactionFilter` on each handler. The same filter
     instance is shared between handlers — the second invocation sees
     already-redacted text and is a no-op.
+
+    ``console=False`` skips the stderr handler — the interactive shell
+    uses this so background-stream logs land in the file and the ring
+    buffer instead of scrolling over the prompt. Every handler in
+    ``extra_handlers`` gets the shared redaction filter and formatter
+    attached before being installed on the root logger.
 
     Idempotent: existing root-logger handlers are cleared on each call so
     the CLI can call this multiple times during a single invocation
@@ -143,7 +192,13 @@ def setup_logging(
     file_handler.addFilter(redaction_filter)
     root.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    stream_handler.addFilter(redaction_filter)
-    root.addHandler(stream_handler)
+    if console:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        stream_handler.addFilter(redaction_filter)
+        root.addHandler(stream_handler)
+
+    for handler in extra_handlers:
+        handler.setFormatter(formatter)
+        handler.addFilter(redaction_filter)
+        root.addHandler(handler)

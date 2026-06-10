@@ -289,13 +289,14 @@ def test_missing_agent_id_skips_reporter_and_warns(
 
     real = supervisor_module._register_if_needed
 
-    def patched(*, cfg, state, client, capabilities, save_progress):
+    def patched(*, cfg, state, client, capabilities, save_progress, planned=None):
         new_state = real(
             cfg=cfg,
             state=state,
             client=client,
             capabilities=capabilities,
             save_progress=save_progress,
+            planned=planned,
         )
         if new_state is not None:
             new_state = new_state.model_copy(update={"agent_id": None})

@@ -40,6 +40,16 @@ class CameraDependencyMissingError(CameraError):
     """Raised when a required camera system library (e.g. OpenCV) is not installed."""
 
 
+class PreflightError(UpstreamError):
+    """Raised by the local limits pre-check when the configured stream can
+    never be accepted by the server (e.g. disallowed source type or codec).
+
+    Distinct from :class:`ApiValidationError`: this fires *before* any
+    request goes on the wire. The server remains the final enforcement
+    point; the pre-check just fails earlier with a friendlier message.
+    """
+
+
 class ApiError(UpstreamError):
     """Base class for all UpStream API client errors."""
 

@@ -540,6 +540,7 @@ def test_camera_register_payload_uses_stable_external_id_and_device_path() -> No
     assert sent.name == "Front Door"
     assert sent.external_id == "webcam-0"
     assert sent.device_path == "webcam:0"
+    assert sent.source_type == "webcam"
     assert sent.default_width == 1280
     assert sent.default_codec == "h264"
     assert sent.default_bitrate_kbps == 3000

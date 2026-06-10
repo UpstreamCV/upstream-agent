@@ -23,6 +23,7 @@ from upstream_agent.api.schemas import (
     AgentRegisterRequest,
     AgentRegisterResponse,
     ApprovedStreamConfig,
+    BootstrapResponse,
     Camera,
     CameraRegisterRequest,
     CameraRegisterResponse,
@@ -249,6 +250,10 @@ class FlakyApiClient:
 
     def __exit__(self, *_: object) -> None:
         return None
+
+    def get_bootstrap(self) -> BootstrapResponse:
+        # No limits -> pre-check passes the local config through.
+        return BootstrapResponse()
 
     def register_agent(self, req: AgentRegisterRequest) -> AgentRegisterResponse:
         self.register_agent_calls.append(req)

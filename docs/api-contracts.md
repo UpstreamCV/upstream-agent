@@ -631,3 +631,60 @@ Not implemented in M3.2. When the backend signals "rotate token" via
 a future heartbeat endpoint, the agent will write the new token back
 to `~/.upstream/config.yaml` using the same atomic write strategy as
 the state file. Tracked under the heartbeat milestone.
+
+## Smart flow additions (bootstrap, source_type, claim)
+
+### `GET /v1/agents/bootstrap`
+
+Auth: bearer agent token. Returns the server-side context for the
+token's account: `account` (id/name/slug/plan/status — `plan` is a
+label, never used for privileges), `token` (scopes/last_four/expires_at;
+never the secret), `agents` (all registered agents, `[]` when none),
+`limits` (all account caps **including `allowed_stream_types`**),
+`usage` (camera_count / active_session_count / monthly_minutes_used),
+`cameras` (full camera records incl. `source_type` and nullable
+`agent_id`), and `active_sessions` (reduced shape — **no `srt_url`, no
+`streamid`, no tokens**).
+
+Client: `UpstreamApiClient.get_bootstrap()` → `BootstrapResponse`
+(`api/schemas.py`; everything optional/tolerant). A 404 from an older
+server surfaces as `ApiValidationError`; callers treat that as
+"bootstrap unavailable" and continue — the pre-check is skipped and the
+server enforces limits as always.
+
+Uses on the agent:
+- `run_agent` fetches bootstrap once per run (best effort) and feeds the
+  limits to `upstream_agent/preflight.py::plan_stream_config`, which
+  clamps requested width/height/fps/bitrate to the account caps before
+  the session request and emits a `limits_precheck` event listing each
+  adjustment, then a `config_decision` event after approval
+  (`Requested: …` / `Approved: …` / `Action: using server-approved
+  config`). Disallowed codec or source type raises `PreflightError`
+  before any request — these can't be clamped.
+- The interactive shell (`upstream` with no subcommand) renders account
+  / limits / cameras / streams views from the cached bootstrap.
+
+### Camera `source_type`
+
+`POST /v1/cameras/register` now carries `source_type`
+(`cfg.camera.source_type`, omitted when unset). The server validates it
+against `account_limits.allowed_stream_types` and rejects with 403
+`limit_exceeded.stream_type_not_allowed`; the same check runs again at
+session start against the camera's stored value.
+
+### `POST /v1/cameras/{camera_id}/claim`
+
+Auth: bearer agent token. Body `{ "agent_id": "<uuid>" }`. Used by the
+interactive shell to take ownership of a dashboard-created (unassigned)
+camera before starting it. Client: `claim_camera(camera_id=…,
+agent_id=…)`. 409 `camera_claimed_by_other_agent` when another agent
+holds the camera; session start returns 409 `camera_unassigned` for
+unclaimed cameras.
+
+### Blocked-by-limits heartbeat
+
+When a session start is rejected with a `limit_exceeded.*` code, the
+supervisor sends one best-effort heartbeat (`status="error"`,
+`last_error="blocked by limits: …"` truncated to 512 chars) so the
+dashboard can distinguish "agent broken" from "account at capacity".
+Failures sending it are swallowed; it carries no secrets.

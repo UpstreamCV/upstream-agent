@@ -203,6 +203,55 @@ logging:
 """
 
 
+def save_api_token(token: str, path: Path | None = None) -> Path:
+    """Persist ``token`` into the YAML config, preserving everything else.
+
+    Used by the interactive shell's ``login`` flow. Creates the file from
+    the template when it doesn't exist yet (so a brand-new user can run
+    bare ``upstream`` and paste a token without ever editing YAML), then
+    rewrites only the ``api.token`` value.
+
+    The token is written verbatim to the user-owned config file — the
+    same place ``upstream init`` tells users to put it — and is never
+    logged or echoed by callers.
+    """
+
+    target = resolve_config_path(path)
+
+    if not target.exists():
+        write_default_config(target)
+
+    try:
+        raw_text = target.read_text(encoding="utf-8")
+        raw = yaml.safe_load(raw_text)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"Could not read config file {target}: {exc}") from None
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"Config file {target} must be a YAML mapping at the top level.")
+
+    api_section = raw.get("api")
+    if not isinstance(api_section, dict):
+        api_section = {"base_url": "https://api.upstreamcv.com"}
+    api_section["token"] = token
+    raw["api"] = api_section
+
+    # NOTE: yaml.safe_dump drops the template's comments. Acceptable —
+    # the comments only explain how to fill in the token, which is
+    # exactly what just happened.
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            yaml.safe_dump(raw, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise ConfigError(f"Could not write config file {target}: {exc}") from None
+    return target
+
+
 def write_default_config(path: Path, force: bool = False) -> None:
     """Write a template config to ``path``.
 

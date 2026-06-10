@@ -101,6 +101,12 @@ class CameraRegisterRequest(BaseModel):
     name: str = Field(..., min_length=1)
     external_id: str = Field(..., min_length=1)
     device_path: str = Field(..., min_length=1)
+    # Declared source kind ("webcam" | "rtsp"). Optional + omitted when
+    # None (client serializes with exclude_none) so older servers see an
+    # unchanged payload. The server validates it against the account's
+    # allowed_stream_types and rejects with
+    # limit_exceeded.stream_type_not_allowed.
+    source_type: str | None = None
     default_width: int = Field(..., gt=0)
     default_height: int = Field(..., gt=0)
     default_fps: int = Field(..., gt=0)
@@ -122,6 +128,7 @@ class Camera(BaseModel):
     name: str | None = None
     external_id: str | None = None
     device_path: str | None = None
+    source_type: str | None = None
     status: str | None = None
     default_width: int | None = None
     default_height: int | None = None
@@ -331,3 +338,137 @@ class HeartbeatBatchResponse(BaseModel):
 
     accepted: int
     server_time: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap (GET /v1/agents/bootstrap)
+# ---------------------------------------------------------------------------
+#
+# Everything below is deliberately tolerant: only the identifiers the agent
+# truly needs are required; every other field is optional so the agent keeps
+# working against older servers (where the endpoint may not exist at all —
+# the client surfaces that as ApiValidationError and callers degrade
+# gracefully) and newer servers that add fields.
+
+
+class BootstrapAccount(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., min_length=1)
+    name: str | None = None
+    slug: str | None = None
+    # Informational label only — the agent never derives privileges from it.
+    plan: str | None = None
+    status: str | None = None
+
+
+class BootstrapTokenInfo(BaseModel):
+    """Metadata about the API token in use. Never contains the secret."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    last_four: str | None = None
+    expires_at: str | None = None
+
+
+class BootstrapLimits(BaseModel):
+    """Account caps as the server reports them.
+
+    All optional: a missing field means "the server didn't say", and the
+    local pre-check (:mod:`upstream_agent.preflight`) skips that dimension —
+    the server remains the enforcement point either way.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    max_cameras: int | None = None
+    max_concurrent_sessions: int | None = None
+    max_fps: int | None = None
+    max_width: int | None = None
+    max_height: int | None = None
+    max_bitrate_kbps: int | None = None
+    allowed_codecs: list[str] | None = None
+    allowed_stream_types: list[str] | None = None
+    monthly_minutes_quota: int | None = None
+    snapshot_storage_mb: int | None = None
+
+
+class BootstrapUsage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    camera_count: int | None = None
+    active_session_count: int | None = None
+    monthly_minutes_used: int | None = None
+
+
+class BootstrapSessionSummary(BaseModel):
+    """An active session as reported by bootstrap.
+
+    Carries no SRT URL, streamid, or token — the server's bootstrap
+    contract excludes them by design.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., min_length=1)
+    camera_id: str | None = None
+    agent_id: str | None = None
+    state: str | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+    started_at: str | None = None
+    approved: dict[str, object] | None = None
+
+
+class BootstrapResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    account: BootstrapAccount | None = None
+    token: BootstrapTokenInfo | None = None
+    agents: list[Agent] = Field(default_factory=list)
+    limits: BootstrapLimits | None = None
+    usage: BootstrapUsage | None = None
+    cameras: list[Camera] = Field(default_factory=list)
+    active_sessions: list[BootstrapSessionSummary] = Field(default_factory=list)
+    server_time: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Camera claim (POST /v1/cameras/{camera_id}/claim)
+# ---------------------------------------------------------------------------
+
+
+class CameraClaimRequest(BaseModel):
+    """Body of ``POST /v1/cameras/{camera_id}/claim``.
+
+    Assigns a dashboard-created (unassigned) camera to this agent so a
+    stream session can be started for it. The server rejects claims on
+    cameras held by a different agent with
+    ``camera_claimed_by_other_agent`` (409).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(..., min_length=1)
+
+
+class CameraClaimResponse(BaseModel):
+    """The claimed camera record. Same tolerant shape as ``Camera``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., min_length=1)
+    agent_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_nested(cls, data: object) -> object:
+        # Server returns the flat camera record; tolerate a wrapped
+        # {"camera": {...}} shape too, mirroring CameraRegisterResponse.
+        if isinstance(data, dict) and "camera" in data and "id" not in data:
+            inner = data["camera"]
+            if isinstance(inner, dict):
+                return inner
+        return data

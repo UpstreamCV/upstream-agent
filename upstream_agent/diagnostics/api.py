@@ -256,6 +256,7 @@ def _obtain_stream_approval(
         name=cfg.camera.name,
         external_id=_camera_external_id(cfg.camera),
         device_path=_camera_device_path(cfg.camera),
+        source_type=cfg.camera.source_type,
         default_width=cfg.camera.requested_width,
         default_height=cfg.camera.requested_height,
         default_fps=cfg.camera.requested_fps,

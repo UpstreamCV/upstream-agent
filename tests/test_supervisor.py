@@ -18,6 +18,7 @@ from upstream_agent.api.schemas import (
     AgentRegisterRequest,
     AgentRegisterResponse,
     ApprovedStreamConfig,
+    BootstrapResponse,
     Camera,
     CameraRegisterRequest,
     CameraRegisterResponse,
@@ -228,6 +229,10 @@ class FakeApiClient:
     def __exit__(self, *_: object) -> None:
         return None
 
+    def get_bootstrap(self) -> BootstrapResponse:
+        # No limits -> pre-check passes the local config through.
+        return BootstrapResponse()
+
     def register_agent(self, req: AgentRegisterRequest) -> AgentRegisterResponse:
         self.register_agent_calls.append(req)
         if self._agent_raises is not None:
@@ -370,6 +375,33 @@ def _collect_events() -> tuple[list[tuple[str, str]], Any]:
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
+
+
+def test_run_agent_accepts_external_shutdown_event() -> None:
+    """A pre-set external shutdown Event exits the loop before any attempt."""
+
+    import threading
+
+    factories = _make_factories()
+    shutdown = threading.Event()
+    shutdown.set()
+
+    result, _ = run_agent(
+        _cfg(), _state(),
+        camera_factory=factories["camera_factory"],
+        client_factory=factories["client_factory"],
+        ffmpeg_factory=factories["ffmpeg_factory"],
+        ffmpeg_probe=_happy_probe(),
+        shutdown=shutdown,
+        max_frames=100,
+    )
+
+    assert result.exit_reason == "keyboard_interrupt"
+    assert result.frames_written == 0
+    client: FakeApiClient = factories["client"]
+    assert client.start_session_calls == []
+    cam: FakeCamera = factories["cam"]
+    assert cam.close_calls == 1  # outer cleanup still ran
 
 
 def test_happy_path_completes_max_frames_and_cleans_up_in_order() -> None:

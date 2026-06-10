@@ -35,6 +35,43 @@ pip install upstream-agent
 
 ## Quick start
 
+The fastest path is the interactive terminal — run `upstream` with no
+arguments:
+
+```bash
+upstream
+```
+
+This opens a live session. If no API token is configured yet, type
+`login` and paste a token (created on the dashboard under API Tokens —
+input is hidden and never echoed). Once connected the shell shows your
+account, limits, and the cameras configured on the dashboard:
+
+```
+Account: Josh Demo (free)
+Agent: macbook-agent
+Status: Connected
+Streams: 0 / 1 active
+Max stream config: 1280x720 @ 30fps
+Allowed source types: webcam, rtsp
+```
+
+Commands: `status`, `account`, `limits`, `cameras`, `streams`,
+`start [camera]`, `stop [camera]`, `logs [n]`, `login`, `refresh`,
+`help`, `quit`. Streams run in the background — `start` returns to the
+prompt immediately, and you can start another camera (if your account
+allows it), check `streams`, or read `logs` while video flows. Logs
+never scroll over the prompt; they go to a ring buffer (`logs`) and
+`~/.upstream/logs/agent.log`. The server is the source of truth: stream
+settings come from the camera's dashboard configuration, requests are
+pre-clamped to your account limits, and the server enforces them
+regardless.
+
+> Behavior change: bare `upstream` used to print help. Use
+> `upstream --help` for the command list.
+
+### Scriptable commands (unchanged)
+
 ```bash
 # 1. Create a default config at ~/.upstream/config.yaml
 upstream init
@@ -360,6 +397,16 @@ The agent stores everything under `~/.upstream/`:
   additional source types and diagnostics.
 
 See `docs/architecture.md` for the planned end-to-end flow.
+
+## Project Tracking
+
+We use GitHub Issues as a lightweight tracker for meaningful bugs,
+features, follow-ups, and milestone work. Issues should include clear
+context and acceptance criteria, but should not become heavy process.
+Small fast-moving implementation details can stay in PRs, commit logs,
+or working notes.
+
+The cross-repo plan lives in `../docs/github-issues-plan.md`.
 
 ## License
 
