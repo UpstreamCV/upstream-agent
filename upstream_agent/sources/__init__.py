@@ -4,8 +4,9 @@ Each source implements :class:`VideoSource` and answers the same five
 questions: can I be opened, what resolution am I producing, what FPS am
 I producing, am I currently connected, and what was my last error.
 
-Milestone 2 ships only :class:`WebcamSource`. Future milestones add
-RTSP, video-file, and IP-camera sources alongside the webcam.
+The only supported source today is :class:`WebcamSource` (a local USB
+or built-in camera). The :class:`VideoSource` ABC remains in place so a
+future test-only file source can slot in without reshaping the runtime.
 """
 
 from upstream_agent.sources.base import Frame, FrameInfo, VideoSource

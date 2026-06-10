@@ -1,8 +1,10 @@
 """Tests for :func:`upstream_agent.diagnostics.camera.run_camera_check`.
 
 These tests stub :class:`WebcamSource` so the orchestrator's logic
-(success path, open failure, read failure, unsupported source_type) is
-exercised without going through OpenCV at all.
+(success path, open failure, read failure) is exercised without going
+through OpenCV at all. ``source_type`` is locked to ``"webcam"`` at the
+Pydantic layer (see ``test_config.py``); the orchestrator no longer
+carries a runtime guard for it.
 """
 
 from __future__ import annotations
@@ -137,22 +139,3 @@ def test_read_failure_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert instances[0].close_count == 1
 
 
-def test_unsupported_source_type_short_circuits_without_constructing_source(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    constructed: list[CameraConfig] = []
-
-    def factory(cfg: CameraConfig) -> object:
-        constructed.append(cfg)
-        raise AssertionError("WebcamSource must not be constructed for rtsp")
-
-    monkeypatch.setattr(camera_module, "WebcamSource", factory)
-
-    cfg = _cfg(source_type="rtsp", source="rtsp://example/stream")
-    result = run_camera_check(cfg)
-
-    assert result.success is False
-    assert result.error is not None
-    assert "rtsp" in result.error
-    assert "not supported yet" in result.error
-    assert constructed == []

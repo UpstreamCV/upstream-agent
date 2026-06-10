@@ -342,15 +342,17 @@ def test_check_camera_unsupported_source_type_exits_one(
     home_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_camera_config(home_dir, source_type="rtsp", source="rtsp://example/stream")
-    # cv2 must not even be consulted; install a poisoned module so any
-    # accidental access blows up the test instead of silently passing.
+    # The config loader should reject the value at load time, before any
+    # camera code runs. Poison cv2 so any accidental access blows up the
+    # test instead of silently passing.
     poisoned = types.SimpleNamespace()
     monkeypatch.setitem(sys.modules, "cv2", poisoned)
 
     result = runner.invoke(app, ["check", "--camera"])
     assert result.exit_code == 1
-    assert "rtsp" in result.stderr
-    assert "not supported yet" in result.stderr
+    assert "Error" in result.stderr
+    assert "camera.source_type" in result.stderr
+    assert "webcam" in result.stderr
 
 
 def test_check_camera_works_with_placeholder_token(

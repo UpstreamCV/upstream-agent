@@ -321,7 +321,7 @@ api:
 
 API tokens look like `ups_<env>_<8-char id>_<22-char secret>`.
 
-See `examples/webcam.yaml` and `examples/rtsp.yaml` for fuller templates.
+See `examples/webcam.yaml` for a fuller template.
 
 ## Local file layout
 

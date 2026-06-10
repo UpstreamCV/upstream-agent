@@ -133,7 +133,19 @@ def _cfg(
 def test_webcam_source_rejects_non_webcam_source_type() -> None:
     from upstream_agent.sources.webcam import WebcamSource
 
-    cfg = _cfg(source="rtsp://example/stream", source_type="rtsp")
+    # The Pydantic schema rejects non-webcam values at config load
+    # (covered in test_config.py). This test exercises the defensive
+    # check inside WebcamSource.__init__ by bypassing validation, so a
+    # programmatic CameraConfig that skips the schema still cannot
+    # construct a webcam source with the wrong type.
+    cfg = CameraConfig.model_construct(
+        name="Test Camera",
+        source_type="rtsp",
+        source="rtsp://example/stream",
+        requested_width=1280,
+        requested_height=720,
+        requested_fps=30,
+    )
     with pytest.raises(UnsupportedCameraSourceError):
         WebcamSource(cfg)
 

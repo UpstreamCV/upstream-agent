@@ -32,6 +32,156 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-06-10 - cleanup: webcam-only input + design-doc refresh
+
+### Summary
+A gap-analysis audit of the M7 v0.1.0 codebase surfaced one
+user-visible trap and several deferred items the design docs did
+not call out honestly:
+
+1. **The RTSP trap.** `CameraConfig.source_type` accepted
+   `Literal["webcam", "rtsp"]`, the default YAML template hinted at
+   network-camera support, and `examples/rtsp.yaml` shipped as a
+   ready-to-copy template — but no `RtspSource` ever existed and
+   `diagnostics/camera.py` rejected the value at runtime with a
+   "not supported yet" error. A user who followed the example
+   crashed the agent rather than getting a clean config-load
+   failure.
+2. **Honest doc gaps.** Items the M7 summary flagged as future
+   work (frame buffer, proactive session refresh from
+   `expires_at`, token rotation, session-independent reporter for
+   the `"reconnecting"` heartbeat status) were referenced
+   inconsistently across `architecture.md`, `module-map.md`,
+   `troubleshooting.md`, and `api-contracts.md`.
+
+The agent is **webcam-input only by design** and SRT is the only
+egress protocol. This commit tightens the schema to match,
+removes the RTSP template and example, and rewrites the design
+docs so the next coder/agent has an accurate map of what's done
+vs. what's M8 candidate.
+
+### Files touched
+- `upstream_agent/config.py` — `source_type` is now
+  `Literal["webcam"]`. Pydantic now rejects any other value at
+  config load with a structured `ConfigError`. The default
+  `_TEMPLATE` lost its RTSP comments.
+- `upstream_agent/diagnostics/camera.py` — deleted the
+  `if cfg.source_type != "webcam"` short-circuit. Unreachable
+  after the schema change.
+- `upstream_agent/sources/__init__.py`,
+  `upstream_agent/sources/base.py` — module docstrings no longer
+  name RTSP/IP-camera/file as planned sources. The `VideoSource`
+  ABC stays in place for hypothetical future test sources.
+- `examples/rtsp.yaml` — deleted.
+- `README.md` — example list now mentions only `webcam.yaml`.
+- `tests/test_sources_webcam.py` — the defensive-constructor test
+  now uses `CameraConfig.model_construct(...)` to bypass
+  Pydantic, so it can still exercise the
+  `UnsupportedCameraSourceError` raise inside `WebcamSource`.
+- `tests/test_diagnostics_camera.py` — deleted
+  `test_unsupported_source_type_short_circuits_without_constructing_source`;
+  the orchestrator no longer has a runtime guard to test.
+- `tests/test_cli.py` — `test_check_camera_unsupported_source_type_exits_one`
+  rewritten: writes a config with `source_type: "rtsp"` and now
+  asserts the CLI surfaces the Pydantic-level error
+  (`Error ... camera.source_type ... webcam`) rather than the
+  old runtime "not supported yet" string.
+- `docs/architecture.md`
+  - ASCII flow diagram source box: `(webcam, rtsp)` → `(webcam)`,
+    and labels the frame buffer as `(planned)`.
+  - Layer-status table: split the old "RTSP / IP camera / file
+    sources | planned" row into "Non-webcam input sources | not
+    planned" plus three new M8-candidate rows (frame buffer,
+    session refresh/token rotation/config fetch,
+    session-independent reporter for `"reconnecting"`).
+  - New section "Honest gaps and planned work (M8 candidates)"
+    near the bottom listing each deferred item with the specific
+    code references that prove it's not yet implemented.
+- `docs/module-map.md`
+  - `sources/base.py` row no longer names RTSP/file/IP-camera.
+  - Deferred-submodules table now lists only the genuinely
+    deferred paths (`buffer/frame_buffer.py`,
+    `api/config_fetch.py`, `diagnostics/network.py`) and adds an
+    explicit "Out of scope: non-webcam input sources" callout.
+  - Removed the `rtsp.yaml` row from the `examples/` table.
+- `docs/troubleshooting.md` — under
+  `Error (register_camera)`, removed the now-obsolete
+  `source_type: "rtsp"` bullet and added a parenthetical noting
+  that `source_type` is locked at config-load time, so an
+  invalid value can never reach `register_camera`.
+- `docs/api-contracts.md`
+  - Added a "Received but not yet acted on — `expires_at`"
+    paragraph to the `start_stream_session` section explaining
+    that the agent receives `expires_at` but does not yet
+    schedule a proactive refresh (M8 candidate, link to
+    `architecture.md`).
+  - Extended the heartbeat `status` field description to make
+    explicit that `"reconnecting"` is reserved in the contract
+    but not currently emitted (reporter is session-scoped).
+
+### Functions/classes changed
+- `CameraConfig` (`upstream_agent/config.py`) —
+  `source_type: Literal["webcam"]`. The class is otherwise
+  unchanged; downstream callers that branched on `source_type`
+  no longer need to (only the defensive raise inside
+  `WebcamSource.__init__` survives, and it's only reachable via
+  `CameraConfig.model_construct`).
+- `run_camera_check` (`upstream_agent/diagnostics/camera.py`) —
+  shorter; goes straight to the `WebcamSource` path. Behaviour
+  unchanged for valid configs.
+
+### System interaction notes
+For a valid config the runtime is identical. For an invalid
+`source_type` the failure point moves from
+`diagnostics/camera.py` (a `CameraCheckResult(success=False, ...)`
+returned by the orchestrator at runtime) to `config.load_config`
+(a `ConfigError` raised before any camera, source, or API code
+runs). The CLI's top-level `UpstreamError` handler surfaces it
+as `Error: Invalid config in <path>:\n  - camera.source_type:
+Input should be 'webcam'`. Users now see the problem at the
+earliest possible moment, in a structured format that names the
+field and the allowed value.
+
+The design-doc changes do not affect runtime behaviour at all.
+They make the existing M7 honesty stance (about `expires_at`,
+`reconnecting`, the lack of a frame buffer, etc.) visible to
+anyone reading the docs rather than only to anyone reading the
+M7 summary or the code comments.
+
+### Testing/checks
+- `pytest` — the four updated test files
+  (`test_sources_webcam.py`, `test_diagnostics_camera.py`,
+  `test_cli.py`, plus the pre-existing
+  `test_config.py:test_config_error_message_never_contains_input_token`)
+  cover the schema-level rejection path end-to-end.
+- `upstream init` — confirms the template no longer mentions
+  rtsp.
+- Manual smoke: writing `source_type: "rtsp"` into a config and
+  running `upstream check --camera` produces the new Pydantic
+  error on stderr and exits 1 without consulting OpenCV.
+- `grep -rni rtsp upstream-agent/` — only commit-log history and
+  intentional out-of-scope callouts in `architecture.md` /
+  `module-map.md` remain (plus two tests that use `rtsp://` to
+  prove the SRT URL parser rejects non-SRT schemes, which is
+  about egress and unrelated to source types).
+
+### Follow-up TODOs
+The audit identified four M8 candidates. They are now documented
+in detail in `architecture.md` "Honest gaps and planned work
+(M8 candidates)":
+- Frame buffer (`buffer/frame_buffer.py`) — consume
+  `StreamConfig.buffer_ms`, drain on reconnect.
+- Proactive session refresh keyed off `expires_at` — outer-loop
+  timer that swaps in a fresh session before expiry without
+  tearing down camera or encoder.
+- Token rotation — heartbeat-response signal handling + atomic
+  config rewrite.
+- Session-independent heartbeat reporter — lift the reporter
+  into the outer recovery loop so it can emit `"reconnecting"`
+  during backoff gaps.
+
+---
+
 ## 2026-05-14 - cleanup: honest recovery logging + macOS camera limitation
 
 ### Summary

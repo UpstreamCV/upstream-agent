@@ -1,9 +1,10 @@
 """Abstract base for video sources.
 
 A :class:`VideoSource` is the agent's adapter to whatever produces
-frames — a local webcam today, an RTSP stream tomorrow, a video file
-for tests, a PTZ/IP camera in a later milestone. Every source answers
-the same five questions:
+frames. Today the only concrete source is :class:`WebcamSource`; the
+ABC stays in place so any future source (for example, a test-only file
+source) can slot in without reshaping the runtime. Every source
+answers the same five questions:
 
 * Can I be opened? (``open()``)
 * What resolution am I currently producing? (``info.width/height``)

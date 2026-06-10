@@ -46,7 +46,7 @@ class CameraConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(..., min_length=1)
-    source_type: Literal["webcam", "rtsp"]
+    source_type: Literal["webcam"]
     source: int | str
     requested_width: int = Field(default=1280, gt=0)
     requested_height: int = Field(default=720, gt=0)
@@ -184,10 +184,9 @@ api:
 camera:
   # Human-readable name for this camera.
   name: "Front Door"
-  # "webcam" (local device) or "rtsp" (network camera).
+  # Only "webcam" (local device) is supported.
   source_type: "webcam"
-  # For webcam: integer device index (0 = first camera).
-  # For rtsp: the rtsp:// URL of the stream.
+  # Integer device index (0 = first camera).
   source: 0
   requested_width: 1280
   requested_height: 720

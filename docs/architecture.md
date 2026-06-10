@@ -21,8 +21,8 @@ to the UpStream streaming server.
       ▼                                                         ▼
  ┌──────────┐   frames     ┌─────────────┐  encoded   ┌─────────────┐
  │  source  │ ───────────▶ │frame buffer │ ─────────▶│  ffmpeg    │
- │(webcam,  │              └─────────────┘            │  encoder   │
- │ rtsp)    │                                          └─────┬───────┘
+ │ (webcam) │              │ (planned)   │            │  encoder   │
+ │          │              └─────────────┘            └─────┬───────┘
  └──────────┘                                                │ packets
                                                              ▼
                                                   ┌───────────────────┐
@@ -71,9 +71,10 @@ attempt, and reopens the camera if it disconnects mid-stream.
 | Live SRT streaming end-to-end against real MediaMTX | done (M5) |
 | Heartbeat loop + runtime health reporting | done (M6) |
 | Reconnect/backoff, camera reopen, session restart | done (M7) |
-| Frame buffer | **planned** |
-| Proactive session refresh from `expires_at`, token rotation, config fetch | **planned (M8+)** |
-| RTSP / IP camera / file sources | **planned** |
+| Frame buffer | **planned (M8 candidate)** |
+| Proactive session refresh from `expires_at`, token rotation, config fetch | **planned (M8 candidate)** |
+| Session-independent heartbeat reporter (so `"reconnecting"` status can be emitted) | **planned (M8 candidate)** |
+| Non-webcam input sources (RTSP, IP camera) | **not planned** — agent is webcam-only by design; SRT is the only egress protocol |
 
 ## Camera source layer
 
@@ -527,6 +528,52 @@ stats.snapshot().ffmpeg_running else error` — the
 `reconnecting` literal exists in the API schema but the agent
 does not have a code path that emits it (would require a
 session-independent reporter, which is out of scope for M7).
+
+## Honest gaps and planned work (M8 candidates)
+
+A May 2026 audit cross-checked the design docs against the live code
+and surfaced four items that are referenced in the contract or config
+but **not yet implemented**. They are gathered here so the next
+milestone has a single source of truth for what's actually left to
+build:
+
+1. **Frame buffer.** `StreamConfig.buffer_ms` is parsed and validated
+   by Pydantic (default `500`, range `>=0`) and surfaced in CLI status
+   output, but no code path consumes it. There is no `buffer/`
+   subpackage. Frames produced during recovery backoff are dropped
+   (the M7 summary calls this out). The planned shape is a bounded
+   ring buffer between `source.read_frame()` and
+   `ffmpeg.write_frame()` with a drain-on-reconnect policy.
+
+2. **Proactive session refresh from `expires_at`.** Both the top-level
+   and nested `expires_at` fields on `StreamSessionResponse` are
+   received and Pydantic-validated, but the supervisor never reads
+   them. Today the agent only notices session expiry reactively, when
+   FFmpeg's stdin write fails — a 5–30 s detection delay. The planned
+   shape is an outer-loop timer that requests a fresh session ahead
+   of `expires_at` and swaps it in without tearing down camera or
+   encoder.
+
+3. **Token rotation.** `docs/api-contracts.md` describes a heartbeat
+   response that can signal a token refresh, but
+   `upstream_agent/api/client.py` and `heartbeat/reporter.py` do not
+   parse such a signal, and there is no atomic `~/.upstream/config.yaml`
+   rewrite path. The planned shape is: (a) handle a rotation flag on
+   the heartbeat response, (b) validate the new token via a
+   round-trip, then (c) atomic-rename the config file in place.
+
+4. **Session-independent heartbeat reporter (for `"reconnecting"`).**
+   `HeartbeatStatus` includes the literal `"reconnecting"` in the
+   schema, but the reporter is built and torn down inside each
+   `_run_attempt`, so during the backoff sleep no heartbeat is sent
+   at all. The dashboard sees `streaming` → `error` → `streaming`
+   with no in-between signal. The planned shape is to lift the
+   reporter into the outer recovery loop so it can stay alive
+   between attempts and emit `"reconnecting"` during the gap.
+
+None of these are required for the current v0.1.0 functionality
+(M1–M7 are complete and tested), but they are the natural next set
+of improvements to streaming continuity and contract honesty.
 
 ## Design principles
 

@@ -48,17 +48,6 @@ def run_camera_check(cfg: CameraConfig) -> CameraCheckResult:
         "requested_fps": cfg.requested_fps,
     }
 
-    if cfg.source_type != "webcam":
-        return CameraCheckResult(
-            success=False,
-            info=None,
-            error=(
-                f"source_type '{cfg.source_type}' is not supported yet. "
-                f"Only 'webcam' is implemented in this build."
-            ),
-            **base_fields,
-        )
-
     try:
         with WebcamSource(cfg) as src:
             src.read_frame()

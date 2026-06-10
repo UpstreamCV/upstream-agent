@@ -15,7 +15,7 @@ Update this file whenever a module is added, removed, or renamed.
 | `logging_setup.py` | `setup_logging`, `TokenRedactionFilter`, and the pure `redact_token` helper. **Named `logging_setup` (not `logging`) to avoid shadowing the stdlib `logging` module.** |
 | `errors.py` | Exception hierarchy: `UpstreamError` → `ConfigError`, `StateError`, `CameraError` (`CameraOpenError`, `CameraReadError`, `UnsupportedCameraSourceError`, `CameraDependencyMissingError`), `ApiError` (`ApiConnectionError`, `ApiAuthError` → `ApiTokenRevokedError`, `ApiTokenExpiredError`, `ApiValidationError`, `ApiRateLimitError`, `ApiServerError`, `ApiContractError`), `FfmpegError` (`FfmpegNotFoundError`, `FfmpegProbeError`, `FfmpegSrtUnsupportedError`, `FfmpegH264UnsupportedError`), `SrtUrlError`, `CommandBuildError`, `StreamingRuntimeError` (`FfmpegRuntimeError` → `FfmpegStartError`, `FfmpegWriteError`, `FfmpegExitError`). The CLI catches `UpstreamError` at the top level. |
 | `sources/__init__.py` | Re-exports `VideoSource`, `WebcamSource`, `FrameInfo`. |
-| `sources/base.py` | `VideoSource` ABC (`open`, `read_frame`, `close`, `is_open`, `info`, `last_error`) plus `FrameInfo` dataclass and concrete `__enter__`/`__exit__`. Every future source (RTSP, file, IP camera) implements this interface. |
+| `sources/base.py` | `VideoSource` ABC (`open`, `read_frame`, `close`, `is_open`, `info`, `last_error`) plus `FrameInfo` dataclass and concrete `__enter__`/`__exit__`. Today only `WebcamSource` implements it; the ABC stays in place so a future test-only file source can slot in without reshaping the runtime. |
 | `sources/webcam.py` | `WebcamSource(VideoSource)` — wraps `cv2.VideoCapture`. Lazy `cv2` import via `_import_cv2()` so a missing OpenCV install becomes `CameraDependencyMissingError`. On macOS the capture is built with `cv2.CAP_AVFOUNDATION` explicitly when that constant is available, so the backend choice is deterministic; non-macOS platforms keep OpenCV's default selection. Writes width/height/fps before checking `isOpened()`; reports the effective values via `info`. `close()` is idempotent. |
 | `diagnostics/__init__.py` | Documentation-only package marker for local diagnostic routines. |
 | `diagnostics/camera.py` | `CameraCheckResult` dataclass and `run_camera_check(cfg)`. Never raises; the CLI translates the result to stdout / stderr / exit code. |
@@ -40,14 +40,20 @@ Update this file whenever a module is added, removed, or renamed.
 
 These directories are intentionally **not present** yet. They will be
 added in the milestone that needs them so their shape is informed by
-real requirements, not premature placeholders.
+real requirements, not premature placeholders. See
+`architecture.md` "Honest gaps and planned work (M8 candidates)" for
+the up-to-date motivation and target shape of each.
 
 | Path | Milestone | Purpose |
 | --- | --- | --- |
-| `api/config_fetch.py` | Later API milestones | Additional HTTP call (get-config). |
-| `sources/rtsp.py`, `sources/file.py`, `sources/ip_camera.py` | Later source milestones | Additional `VideoSource` implementations. |
-| `buffer/frame_buffer.py` | Buffering milestone | Bounded ring buffer between source and encoder. |
-| `diagnostics/network.py` | Later diagnostics milestones | Additional `upstream check --…` probes. |
+| `buffer/frame_buffer.py` | M8 candidate | Bounded ring buffer between source and encoder. Consumes `StreamConfig.buffer_ms` (already in the schema). |
+| `api/config_fetch.py` | M8+ | Additional HTTP call (get-config) for dashboard-driven config rotation. |
+| `diagnostics/network.py` | M8+ | Additional `upstream check --…` probes for API and streaming-server reachability. |
+
+**Explicitly out of scope:** non-webcam input sources (RTSP, IP
+camera). The agent is webcam-only by design; SRT remains the only
+egress protocol. Adding alternate source types is not on the
+roadmap.
 
 ## `tests/`
 
@@ -80,5 +86,4 @@ real requirements, not premature placeholders.
 
 | File | Purpose |
 | --- | --- |
-| `webcam.yaml` | Ready-to-copy config for a local USB or built-in camera. |
-| `rtsp.yaml` | Ready-to-copy config for an RTSP network camera. |
+| `webcam.yaml` | Ready-to-copy config for a local USB or built-in camera. The only example template. |

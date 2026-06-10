@@ -292,9 +292,13 @@ Common causes:
 
 - **`name` not unique on this agent** — change `camera.name` in
   config.
-- **`source_type: "rtsp"`** — not supported in M3. Use `webcam`.
 - **`requested_*` values out of range** — the server may cap
   resolution or FPS per plan.
+
+(Note: `source_type` is locked to `"webcam"` at config-load time by
+Pydantic, so an invalid value cannot reach `register_camera` — the
+agent fails earlier with `Error: Invalid config in <path>: -
+camera.source_type: Input should be 'webcam'`.)
 
 The `agent_id` was still saved to `~/.upstream/agent_state.json` so
 the next attempt won't re-register the agent.

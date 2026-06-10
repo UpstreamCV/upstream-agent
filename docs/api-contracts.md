@@ -309,6 +309,16 @@ The agent **never**:
   `session_token`.
 - Parses the `session_token` JWT. It is treated as opaque bytes.
 
+**Received but not yet acted on — `expires_at`.** Both the top-level
+`expires_at` and `session.expires_at` are received and validated by the
+agent's Pydantic schema, but the supervisor does **not** currently
+schedule a proactive refresh against them. The agent only notices
+session expiry reactively, when an FFmpeg write fails because the
+ingest server stopped accepting the publish (typically 5–30 s after
+the underlying socket dies). Proactive refresh keyed off `expires_at`
+is an M8 candidate; see `architecture.md` "Honest gaps and planned
+work (M8 candidates)".
+
 ### `POST /v1/stream-sessions/{session_id}/stop`
 
 Stops the named session. Called by `upstream check --api` as a
@@ -450,7 +460,7 @@ batch must belong to that agent.
 | `heartbeats` | yes | 1–100 items per call. M6 sends one at a time. |
 | `camera_id` | no | UUID; must belong to this agent. |
 | `session_id` | no | UUID; must belong to this agent. |
-| `status` | yes | Exactly one of `"online"`, `"streaming"`, `"error"`, `"reconnecting"`. The agent sends `"streaming"` while FFmpeg is running and frames are flowing. |
+| `status` | yes | Exactly one of `"online"`, `"streaming"`, `"error"`, `"reconnecting"`. The agent sends `"streaming"` while FFmpeg is running and frames are flowing, and `"error"` otherwise. `"reconnecting"` is reserved in the contract for forward compatibility but is **not currently emitted** — the reporter is session-scoped and torn down between recovery attempts, so the dashboard sees no in-between signal during backoff gaps. A session-independent reporter that could emit `"reconnecting"` is an M8 candidate; see `architecture.md` "Honest gaps and planned work (M8 candidates)". |
 | `fps` | no | Float, 0..1000. Computed over a sliding 60-frame window. |
 | `bitrate_kbps` | no | Int, 0..200000. The server-approved bitrate. |
 | `width`, `height` | no | Int, 1..7680 / 1..4320. The server-approved resolution. |
