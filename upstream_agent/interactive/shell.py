@@ -38,6 +38,12 @@ from upstream_agent.api.schemas import (
     BootstrapResponse,
     Camera,
 )
+from upstream_agent.branding import (
+    BRAND_BLUE,
+    BRAND_GOLD,
+    BRAND_GREEN,
+    logo_text,
+)
 from upstream_agent.config import Config, load_config, save_api_token
 from upstream_agent.diagnostics.api import (
     _agent_name_from,
@@ -58,6 +64,38 @@ from upstream_agent.supervisor import run_agent
 from upstream_agent.version import __version__
 
 logger = logging.getLogger(__name__)
+
+# Brand styling (see upstream_agent.branding): green is the main color —
+# logo, borders, headings, healthy states; blue carries information;
+# gold marks highlights and in-between states. Errors stay red.
+_G = BRAND_GREEN
+_B = BRAND_BLUE
+_GOLD = BRAND_GOLD
+
+_WORKER_STATE_STYLES: dict[str, str] = {
+    "streaming": f"bold {_G}",
+    "starting": _GOLD,
+    "reconnecting": _GOLD,
+    "error": "bold red",
+    "stopped": _B,
+    "idle": _B,
+}
+
+
+def _state_markup(state: str) -> str:
+    style = _WORKER_STATE_STYLES.get(state, _B)
+    return f"[{style}]{state}[/]"
+
+
+def _style_kv_table(table: Table) -> None:
+    """Label column in brand green, value columns in brand blue."""
+
+    if not table.columns:
+        return
+    table.columns[0].style = _G
+    for column in table.columns[1:]:
+        column.style = _B
+
 
 _HELP_LINES: tuple[tuple[str, str], ...] = (
     ("status", "Connection, account, and stream overview"),
@@ -115,18 +153,19 @@ class InteractiveShell:
 
     def run(self) -> int:
         self._load_config()
+        self._console.print(logo_text())
         self._console.print(
             Panel.fit(
-                f"[bold]UpStream agent[/bold] v{__version__} — interactive mode\n"
-                "Type [bold]help[/bold] for commands, [bold]quit[/bold] to exit.",
-                border_style="cyan",
+                f"[bold {_G}]UpStream agent[/] [{_B}]v{__version__}[/] — interactive mode\n"
+                f"Type [bold {_G}]help[/] for commands, [bold {_G}]quit[/] to exit.",
+                border_style=_G,
             )
         )
 
         if not self._has_usable_token():
             self._console.print(
-                "[yellow]No API token configured.[/yellow] "
-                "Type [bold]login[/bold] to enter one (created on the "
+                f"[{_GOLD}]No API token configured.[/] "
+                f"Type [bold {_G}]login[/] to enter one (created on the "
                 "dashboard under API Tokens)."
             )
         else:
@@ -151,7 +190,8 @@ class InteractiveShell:
             handler = getattr(self, f"cmd_{command}", None)
             if handler is None:
                 self._console.print(
-                    f"Unknown command: [bold]{command}[/bold]. Type [bold]help[/bold]."
+                    f"Unknown command: [{_GOLD}]{command}[/]. "
+                    f"Type [bold {_G}]help[/]."
                 )
                 continue
             try:
@@ -174,7 +214,7 @@ class InteractiveShell:
     def cmd_help(self) -> None:
         table = Table(show_header=False, box=None, padding=(0, 2))
         for name, desc in _HELP_LINES:
-            table.add_row(f"[bold]{name}[/bold]", desc)
+            table.add_row(f"[bold {_G}]{name}[/]", f"[{_B}]{desc}[/]")
         self._console.print(table)
 
     def cmd_login(self) -> None:
@@ -207,14 +247,16 @@ class InteractiveShell:
         self._connected = True
         account = boot.account.name if boot.account and boot.account.name else "account"
         self._console.print(
-            f"[green]Connected to {account}[/green] as token "
-            f"{redact_token(token)} (saved to {path})."
+            f"[bold {_G}]Connected to {account}[/] as token "
+            f"[{_B}]{redact_token(token)}[/] (saved to [{_B}]{path}[/])."
         )
         self.cmd_status()
 
     def cmd_refresh(self) -> None:
         if not self._has_usable_token():
-            self._console.print("Not configured — type [bold]login[/bold] first.")
+            self._console.print(
+                f"Not configured — type [bold {_G}]login[/] first."
+            )
             return
         assert self._cfg is not None
         try:
@@ -223,7 +265,8 @@ class InteractiveShell:
         except ApiConnectionError as exc:
             self._connected = False
             self._console.print(
-                f"[red]Disconnected:[/red] {exc} — type [bold]refresh[/bold] to retry."
+                f"[red]Disconnected:[/red] {exc} — type "
+                f"[bold {_G}]refresh[/] to retry."
             )
             return
         except ApiError as exc:
@@ -236,47 +279,51 @@ class InteractiveShell:
         boot = self._bootstrap
         lines: list[str] = []
         if not self._has_usable_token():
-            lines.append("[yellow]Not configured[/yellow] — type [bold]login[/bold]")
+            lines.append(
+                f"[{_GOLD}]Not configured[/] — type [bold {_G}]login[/]"
+            )
         elif not self._connected or boot is None:
             lines.append(
-                "[red]Disconnected from API[/red] — type [bold]refresh[/bold] to retry"
+                f"[red]Disconnected from API[/red] — type [bold {_G}]refresh[/] to retry"
             )
         else:
             account = boot.account
             if account is not None:
                 label = account.name or account.slug or account.id
-                plan = f" ({account.plan})" if account.plan else ""
-                lines.append(f"Account: [bold]{label}[/bold]{plan}")
+                plan = f" [{_GOLD}]({account.plan})[/]" if account.plan else ""
+                lines.append(f"Account: [bold {_G}]{label}[/]{plan}")
             agent = self._my_agent()
             if agent is not None and agent.name:
-                lines.append(f"Agent: {agent.name}")
-            lines.append("Status: [green]Connected[/green]")
+                lines.append(f"Agent: [{_B}]{agent.name}[/]")
+            lines.append(f"Status: [bold {_G}]Connected[/]")
             usage, limits = boot.usage, boot.limits
             if usage is not None and limits is not None:
                 active = usage.active_session_count
                 cap = limits.max_concurrent_sessions
                 if active is not None and cap is not None:
-                    lines.append(f"Streams: {active} / {cap} active")
+                    lines.append(f"Streams: [{_GOLD}]{active} / {cap}[/] active")
                 cams = usage.camera_count
                 cam_cap = limits.max_cameras
                 if cams is not None and cam_cap is not None:
-                    lines.append(f"Cameras: {cams} / {cam_cap}")
+                    lines.append(f"Cameras: [{_GOLD}]{cams} / {cam_cap}[/]")
                 if usage.monthly_minutes_used is not None:
                     quota = limits.monthly_minutes_quota
                     suffix = f" / {quota}" if quota is not None else ""
                     lines.append(
-                        f"Minutes this month: {usage.monthly_minutes_used}{suffix}"
+                        f"Minutes this month: "
+                        f"[{_GOLD}]{usage.monthly_minutes_used}{suffix}[/]"
                     )
             if limits is not None:
                 if limits.max_width and limits.max_height and limits.max_fps:
                     lines.append(
-                        "Max stream config: "
-                        f"{limits.max_width}x{limits.max_height} @ {limits.max_fps}fps"
+                        f"Max stream config: [{_B}]{limits.max_width}x"
+                        f"{limits.max_height} @ {limits.max_fps}fps[/]"
                     )
                 if limits.allowed_stream_types:
                     lines.append(
-                        "Allowed source types: "
+                        f"Allowed source types: [{_B}]"
                         + ", ".join(limits.allowed_stream_types)
+                        + "[/]"
                     )
 
         statuses = self._registry.statuses()
@@ -284,10 +331,16 @@ class InteractiveShell:
             lines.append("")
             lines.append("Local workers:")
             for st in statuses:
-                detail = f" — {st.last_message}" if st.last_message else ""
-                lines.append(f"  {st.name}: [bold]{st.state}[/bold]{detail}")
+                detail = f" [{_B}]— {st.last_message}[/]" if st.last_message else ""
+                lines.append(f"  {st.name}: {_state_markup(st.state)}{detail}")
 
-        self._console.print(Panel("\n".join(lines), title="status", border_style="cyan"))
+        self._console.print(
+            Panel(
+                "\n".join(lines),
+                title=f"[bold {_G}]status[/]",
+                border_style=_G,
+            )
+        )
 
     def cmd_account(self) -> None:
         if not self._require_bootstrap():
@@ -310,7 +363,10 @@ class InteractiveShell:
             table.add_row("Cameras", str(usage.camera_count))
             table.add_row("Active sessions", str(usage.active_session_count))
             table.add_row("Minutes this month", str(usage.monthly_minutes_used))
-        self._console.print(Panel(table, title="account", border_style="cyan"))
+        _style_kv_table(table)
+        self._console.print(
+            Panel(table, title=f"[bold {_G}]account[/]", border_style=_G)
+        )
 
     def cmd_limits(self) -> None:
         if not self._require_bootstrap():
@@ -334,7 +390,10 @@ class InteractiveShell:
             ", ".join(limits.allowed_stream_types or []) or "—",
         )
         table.add_row("Monthly minutes quota", str(limits.monthly_minutes_quota))
-        self._console.print(Panel(table, title="limits", border_style="cyan"))
+        _style_kv_table(table)
+        self._console.print(
+            Panel(table, title=f"[bold {_G}]limits[/]", border_style=_G)
+        )
 
     def cmd_cameras(self) -> None:
         if not self._require_bootstrap():
@@ -344,14 +403,14 @@ class InteractiveShell:
         if not cameras:
             self._console.print(
                 "No cameras configured. Add one on the dashboard (Cameras → "
-                "New) — the agent picks it up on [bold]refresh[/bold]."
+                f"New) — the agent picks it up on [bold {_G}]refresh[/]."
             )
             return
-        table = Table(box=None, padding=(0, 2))
-        table.add_column("Name", style="bold")
-        table.add_column("Type")
-        table.add_column("Source")
-        table.add_column("Default config")
+        table = Table(box=None, padding=(0, 2), header_style=f"bold {_G}")
+        table.add_column("Name", style=f"bold {_G}")
+        table.add_column("Type", style=_B)
+        table.add_column("Source", style=_B)
+        table.add_column("Default config", style=_B)
         table.add_column("Assigned to")
         my_agent_id = self._state.agent_id
         for cam in cameras:
@@ -361,11 +420,11 @@ class InteractiveShell:
                 if cam.default_fps:
                     config += f" @ {cam.default_fps}fps"
             if cam.agent_id is None:
-                assigned = "[yellow]unassigned[/yellow]"
+                assigned = f"[{_GOLD}]unassigned[/]"
             elif cam.agent_id == my_agent_id:
-                assigned = "[green]this agent[/green]"
+                assigned = f"[bold {_G}]this agent[/]"
             else:
-                assigned = "another agent"
+                assigned = f"[{_B}]another agent[/]"
             table.add_row(
                 cam.name or cam.id[:8],
                 cam.source_type or "?",
@@ -373,16 +432,18 @@ class InteractiveShell:
                 config,
                 assigned,
             )
-        self._console.print(Panel(table, title="cameras", border_style="cyan"))
+        self._console.print(
+            Panel(table, title=f"[bold {_G}]cameras[/]", border_style=_G)
+        )
 
     def cmd_streams(self) -> None:
         statuses = self._registry.statuses()
-        table = Table(box=None, padding=(0, 2))
-        table.add_column("Stream", style="bold")
+        table = Table(box=None, padding=(0, 2), header_style=f"bold {_G}")
+        table.add_column("Stream", style=f"bold {_G}")
         table.add_column("State")
-        table.add_column("Detail")
+        table.add_column("Detail", style=_B)
         for st in statuses:
-            table.add_row(st.name, st.state, st.last_message or "")
+            table.add_row(st.name, _state_markup(st.state), st.last_message or "")
         if self._bootstrap is not None:
             local_names = {st.name for st in statuses}
             camera_names = {
@@ -392,17 +453,25 @@ class InteractiveShell:
                 cam_name = camera_names.get(sess.camera_id or "", sess.camera_id or "?")
                 if cam_name in local_names:
                     continue  # already shown as a local worker
-                table.add_row(cam_name, sess.state or "?", "active on server")
+                table.add_row(
+                    cam_name,
+                    _state_markup(sess.state or "?"),
+                    f"[{_GOLD}]active on server[/]",
+                )
         if table.row_count == 0:
             self._console.print(
-                "No streams running. Type [bold]start[/bold] to begin one."
+                f"No streams running. Type [bold {_G}]start[/] to begin one."
             )
             return
-        self._console.print(Panel(table, title="streams", border_style="cyan"))
+        self._console.print(
+            Panel(table, title=f"[bold {_G}]streams[/]", border_style=_G)
+        )
 
     def cmd_start(self, name: str = "") -> None:
         if self._cfg is None or not self._has_usable_token():
-            self._console.print("Not configured — type [bold]login[/bold] first.")
+            self._console.print(
+                f"Not configured — type [bold {_G}]login[/] first."
+            )
             return
         if self._bootstrap is None:
             self.cmd_refresh()
@@ -416,7 +485,7 @@ class InteractiveShell:
         # locally configured camera; registration happens inside run_agent.
         if name:
             self._console.print(
-                f"[red]No camera named '{name}'.[/red] See [bold]cameras[/bold]."
+                f"[red]No camera named '{name}'.[/red] See [bold {_G}]cameras[/]."
             )
             return
         self._spawn_worker(self._cfg, self._state, worker_name=self._cfg.camera.name)
@@ -439,9 +508,9 @@ class InteractiveShell:
                 + ", ".join(w.name for w in running)
             )
             return
-        self._console.print(f"Stopping {worker.name}...")
+        self._console.print(f"[{_GOLD}]Stopping {worker.name}...[/]")
         worker.stop()
-        self._console.print(f"[green]{worker.name} stopped.[/green]")
+        self._console.print(f"[bold {_G}]{worker.name} stopped.[/]")
 
     def cmd_logs(self, arg: str = "") -> None:
         try:
@@ -464,10 +533,10 @@ class InteractiveShell:
         running = self._registry.running()
         if running:
             self._console.print(
-                f"Stopping {len(running)} stream(s) before exit..."
+                f"[{_GOLD}]Stopping {len(running)} stream(s) before exit...[/]"
             )
         self._registry.stop_all()
-        self._console.print("Bye.")
+        self._console.print(f"[bold {_G}]Bye.[/]")
         return 0
 
     def _load_config(self) -> None:
@@ -544,7 +613,9 @@ class InteractiveShell:
             if camera.agent_id is None or camera.agent_id != agent_id:
                 with self._new_client() as client:
                     client.claim_camera(camera_id=camera.id, agent_id=agent_id)
-                self._console.print(f"Claimed camera '{worker_name}' for this agent.")
+                self._console.print(
+                    f"[{_B}]Claimed camera '{worker_name}' for this agent.[/]"
+                )
         except ApiError as exc:
             self._console.print(f"[red]Cannot start '{worker_name}':[/red] {exc}")
             return
@@ -587,7 +658,7 @@ class InteractiveShell:
         self._registry.add(worker)
         worker.start()
         self._console.print(
-            f"[green]Started '{worker_name}'.[/green] It runs in the "
-            "background — use [bold]streams[/bold] / [bold]logs[/bold] to "
-            "watch it, [bold]stop[/bold] to end it."
+            f"[bold {_G}]Started '{worker_name}'.[/] It runs in the "
+            f"background — use [bold {_G}]streams[/] / [bold {_G}]logs[/] to "
+            f"watch it, [bold {_G}]stop[/] to end it."
         )

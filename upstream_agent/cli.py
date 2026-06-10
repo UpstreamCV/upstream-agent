@@ -89,6 +89,10 @@ def _main(
     """
 
     if ctx.invoked_subcommand is not None:
+        # One-time plain welcome for scriptable subcommands. The
+        # interactive shell prints the brand-green logo on every launch
+        # instead, so it skips this to avoid a double logo on first run.
+        maybe_print_welcome()
         return
     raise typer.Exit(code=_launch_interactive(config))
 
@@ -125,7 +129,6 @@ def _launch_interactive(config: Path | None) -> int:
 
 
 def main() -> None:
-    maybe_print_welcome()
     app()
 
 

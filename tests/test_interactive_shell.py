@@ -163,6 +163,39 @@ def _make_shell(
     return shell, fake_client, out, registry
 
 
+def test_launch_shows_logo(tmp_path: Path) -> None:
+    shell, _client, out, _ = _make_shell(tmp_path, ["quit"])
+    shell.run()
+    text = out.getvalue()
+    # The UpStream mark + wordmark print on every launch.
+    assert "$$$$$$$" in text
+    assert "interactive mode" in text
+
+
+def test_brand_colors_render_in_truecolor_terminals(tmp_path: Path) -> None:
+    """Green #344C2C is the main color from the logo down; blue and gold
+    accent. Assert the truecolor escape codes for all three appear."""
+
+    fake_client = FakeShellClient()
+    out = io.StringIO()
+    console = Console(file=out, force_terminal=True, color_system="truecolor", width=100)
+    inputs = iter(["help", "cameras", "quit"])
+    shell = InteractiveShell(
+        config_path=_write_config(tmp_path),
+        state_path=tmp_path / "agent_state.json",
+        ring=RingBufferHandler(),
+        registry=WorkerRegistry(),
+        client_factory=lambda _b, t: fake_client.bind(t),
+        input_fn=lambda _p: next(inputs),
+        console=console,
+    )
+    shell.run()
+    text = out.getvalue()
+    assert "\x1b[38;2;52;76;44" in text  # green #344C2C
+    assert "\x1b[38;2;75;129;108" in text  # blue #4B816C
+    assert "\x1b[38;2;129;118;75" in text  # gold #81764B
+
+
 def test_help_lists_all_commands(tmp_path: Path) -> None:
     shell, _client, out, _ = _make_shell(tmp_path, ["help", "quit"])
     assert shell.run() == 0

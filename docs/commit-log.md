@@ -182,6 +182,48 @@ in detail in `architecture.md` "Honest gaps and planned work
 
 ---
 
+## 2026-06-10 - style: brand-themed interactive shell + logo on every launch
+
+### Summary
+The interactive shell now wears the brand palette top to bottom — green
+`#344C2C` as the main color (logo, panel borders, headings, command
+names, healthy states), blue `#4B816C` for informational text (labels,
+descriptions, secondary values), gold `#81764B` for highlights and
+in-between states (usage counts, unassigned cameras, starting/
+reconnecting workers, hints). Errors stay red — semantic, not brand.
+The existing ASCII logo (`branding.LOGO`) prints in brand green on
+**every** shell launch; the one-time plain welcome moved from `main()`
+into the subcommand path of the CLI callback so the first bare launch
+doesn't show the logo twice and scriptable subcommands keep their
+first-run welcome exactly as before.
+
+### Files touched
+- `upstream_agent/branding.py` — `BRAND_GREEN`/`BRAND_BLUE`/`BRAND_GOLD`
+  constants + `logo_text()` (Rich Text, green mark, bold-green wordmark).
+- `upstream_agent/interactive/shell.py` — palette applied everywhere:
+  logo + banner, all five panels, key/value + camera/stream tables,
+  worker-state colors via `_state_markup`, command-name accents.
+- `upstream_agent/cli.py` — `maybe_print_welcome()` moved out of
+  `main()` into the callback's subcommand branch.
+- `tests/test_interactive_shell.py` — logo-on-launch test + a truecolor
+  test asserting the exact RGB escape codes for all three brand colors.
+
+### Functions/classes changed
+- `logo_text()` — new; `_state_markup` / `_style_kv_table` — small
+  styling helpers in shell.py.
+
+### System interaction notes
+Rich truecolor renders the hex values exactly in modern terminals and
+degrades to nearest-color elsewhere; non-TTY output (pipes, tests with
+`force_terminal=False`) is plain text, so nothing scripted changes.
+
+### Testing/checks
+- `pytest` — 421 passed (2 new). Visual smoke with COLORTERM=truecolor
+  confirmed the exact RGB escape sequences.
+
+### Follow-up TODOs
+- None.
+
 ## 2026-06-10 - feat: interactive `upstream` shell + server-controlled stream config (smart flow)
 
 ### Summary
