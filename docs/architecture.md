@@ -46,7 +46,7 @@ builder, and `upstream check --streaming`. Milestone 5 adds the
 command that actually streams video. **Milestone 6** adds the
 heartbeat loop: a background thread that POSTs runtime telemetry
 (status, fps, bitrate, resolution, last error) to
-`POST /v1/heartbeats` every 5 seconds while the stream is active.
+`POST /v1/heartbeats` every 15 seconds while the stream is active.
 **Milestone 7** makes the runtime resilient: transient FFmpeg,
 SRT, network, and camera failures no longer kill the agent.
 The supervisor now runs an interruptible recovery loop with

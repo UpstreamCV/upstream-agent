@@ -493,7 +493,7 @@ end-to-end.
 ## Heartbeat / dashboard offline (`upstream run`)
 
 While `upstream run` is active, a background thread POSTs a
-heartbeat to `POST /v1/heartbeats` every 5 seconds. The dashboard
+heartbeat to `POST /v1/heartbeats` every 15 seconds. The dashboard
 uses those to mark the camera/session online and surface basic
 runtime telemetry (fps, bitrate, resolution, last error).
 
@@ -503,7 +503,7 @@ Check `~/.upstream/logs/agent.log` for `Heartbeat send failed
 (transient): ...` lines. Common causes:
 
 - **API unreachable from the agent host** — network blip, DNS,
-  proxy. The agent will keep retrying on the next 5-second tick.
+  proxy. The agent will keep retrying on the next 15-second tick.
   Run `upstream check --api` in a second terminal to confirm
   baseline connectivity.
 - **API server slow / 5xx** — the warning carries the `code=` and
@@ -543,10 +543,10 @@ curl -H "Authorization: Bearer <token>" \
   https://api.upstreamcv.com/v1/agents/<agent_id>/heartbeats?limit=5
 ```
 
-A non-empty list with `reported_at` advancing every ~5 seconds
+A non-empty list with `reported_at` advancing every ~15 seconds
 means the agent side is working — the dashboard's stale-time
 window may simply not have refreshed yet, or its threshold for
-"online" is longer than 5 seconds.
+"online" is longer than 15 seconds.
 
 ### `agent_id missing from state; heartbeat reporter not started.`
 
@@ -720,7 +720,7 @@ heartbeat thread (`Heartbeat send failed (transient): ...`) and
 eventually as a `FfmpegExitError` once FFmpeg's SRT socket
 times out. The recovery loop backs off and retries. The
 heartbeat thread doesn't have its own backoff — repeated
-transient failures just keep logging warnings every 5 s. If the
+transient failures just keep logging warnings every 15 s. If the
 network is down for hours the agent keeps retrying forever; hit
 Ctrl+C to stop.
 

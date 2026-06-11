@@ -178,7 +178,7 @@ def test_reporter_includes_stats_snapshot_data() -> None:
 
 def test_reporter_stop_joins_quickly() -> None:
     client = FakeClient()
-    reporter, _ = _make_reporter(client=client, interval_s=5.0)
+    reporter, _ = _make_reporter(client=client, interval_s=15.0)
 
     reporter.start()
     # The thread should be alive in its long sleep.
@@ -189,7 +189,7 @@ def test_reporter_stop_joins_quickly() -> None:
     reporter.stop(timeout=2.0)
     elapsed = time.monotonic() - start
     # stop_event.wait wakes the thread immediately; join should be well
-    # under the 5s interval.
+    # under the 15s interval.
     assert elapsed < 1.0
 
 

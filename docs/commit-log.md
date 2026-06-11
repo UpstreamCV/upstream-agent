@@ -32,6 +32,79 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-06-11 - ops: heartbeat interval 5 s -> 15 s + minimal CI workflow
+
+### Summary
+Two independent quick wins from the platform roadmap:
+
+1. **Heartbeat cadence 5 s -> 15 s.** `DEFAULT_HEARTBEAT_INTERVAL_S`
+   in `heartbeat/reporter.py` goes from `5.0` to `15.0`. At fleet
+   scale (1000 agents) this cuts control-plane heartbeat writes from
+   ~200/s to ~67/s. This is the constant-only change; the
+   server-tunable interval (delivered via the `/start` response) is
+   future work and is intentionally **not** built here — the backend
+   still returns no next-interval directive, so the agent keeps a
+   fixed value.
+2. **CI bootstrap.** New `.github/workflows/ci.yml`: on every push
+   and pull request, ubuntu-latest sets up Python 3.11, installs the
+   package with `pip install -e ".[dev]"` (the README's documented
+   dev install), and runs `pytest -q`. Minimal by design; lint/type
+   gates can be layered on later. No system packages are needed:
+   the only native dependency (`cv2`) is imported lazily inside
+   `WebcamSource._import_cv2` and every test stubs it.
+
+### Files touched
+- `upstream_agent/heartbeat/reporter.py` —
+  `DEFAULT_HEARTBEAT_INTERVAL_S: float = 15.0` (was `5.0`). No other
+  logic changes; `interval_s` stays constructor-injectable.
+- `tests/test_heartbeat_reporter.py` —
+  `test_reporter_stop_joins_quickly` now uses `interval_s=15.0` as
+  its "long sleep" interval (was `5.0`) and the comment matches; the
+  test still asserts `stop()` returns in well under the interval.
+- `.github/workflows/ci.yml` — new; push + pull_request, single
+  ubuntu-latest job (checkout -> setup-python 3.11 ->
+  `pip install -e ".[dev]"` -> `pytest -q`).
+- `docs/api-contracts.md` — Milestone 6 note: heartbeat cadence now
+  reads "every 15 seconds".
+- `docs/architecture.md` — Milestone 6 paragraph: same 5 -> 15 fix.
+- `docs/module-map.md` — `heartbeat/reporter.py` row: interval
+  default now documented as `15.0`.
+- `docs/troubleshooting.md` — heartbeat section: cadence, retry-tick,
+  `reported_at` spacing, dashboard "online" threshold, and the
+  network-drop warning rate all updated from 5 s to 15 s.
+
+### Functions/classes changed
+- `DEFAULT_HEARTBEAT_INTERVAL_S` (module constant) — the only code
+  change. `HeartbeatReporter` itself is untouched; its loop already
+  sleeps on `stop_event.wait(self._interval_s)`, so `stop()` still
+  wakes the thread immediately regardless of interval length.
+
+### System interaction notes
+Dashboards or monitors that infer "online" from heartbeat recency
+must tolerate ~15 s gaps (the server-side healthy window is already
+wider than that). Transient-failure warnings in `agent.log` now
+appear at most every 15 s instead of every 5 s. Nothing else in the
+runtime keys off the heartbeat interval — supervisor fatal-reason
+polling is per-frame, not per-heartbeat.
+
+### Testing/checks
+- `pytest -q` — 419 passed.
+- Grepped code + tests + docs for remaining 5-second heartbeat
+  assumptions; the only remaining "5 s" mentions are unrelated
+  constants (camera validation window, FFmpeg stop timeout) and
+  historical commit-log entries, which were left as written.
+- The workflow itself runs on the first push to GitHub; not
+  executable locally.
+
+### Follow-up TODOs
+- Server-tunable heartbeat interval via the `/start` response
+  (paired with the persistent supervisor-scoped reporter and the
+  `"reconnecting"` status work).
+- CI: add `ruff check` / `mypy` jobs and a Python-version matrix
+  (3.10–3.12) once the test job has baked.
+
+---
+
 ## 2026-06-10 - cleanup: webcam-only input + design-doc refresh
 
 ### Summary

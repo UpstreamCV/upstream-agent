@@ -62,7 +62,7 @@ from upstream_agent.runtime.stats import RuntimeStats
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HEARTBEAT_INTERVAL_S: float = 5.0
+DEFAULT_HEARTBEAT_INTERVAL_S: float = 15.0
 """Heartbeat cadence. The backend does not return a next-interval
 directive, so the agent picks a fixed value."""
 

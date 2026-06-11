@@ -35,7 +35,7 @@ reflect what the API team has settled on.
 >
 > **Milestone 6 update:** one new endpoint —
 > `POST /v1/heartbeats?agent_id=<uuid>`. While `upstream run` is
-> streaming, a background thread POSTs a heartbeat every 5 seconds
+> streaming, a background thread POSTs a heartbeat every 15 seconds
 > so the API can mark the camera/session online and surface basic
 > runtime telemetry. The heartbeat carries no SRT URL, streamid, or
 > session token. See the new section below for the confirmed
