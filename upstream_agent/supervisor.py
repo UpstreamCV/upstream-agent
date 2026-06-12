@@ -58,7 +58,7 @@ from upstream_agent.api.client import UpstreamApiClient
 from upstream_agent.api.schemas import (
     AgentRegisterRequest,
     ApprovedStreamConfig,
-    BootstrapLimits,
+    BootstrapResponse,
     CameraRegisterRequest,
     Heartbeat,
     RequestedStreamConfig,
@@ -106,6 +106,13 @@ from upstream_agent.runtime.backoff import BackoffPolicy
 from upstream_agent.runtime.stats import RuntimeStats
 from upstream_agent.sources.base import VideoSource
 from upstream_agent.sources.webcam import WebcamSource
+from upstream_agent.update_check import (
+    UpdateStatus,
+    VersionPolicy,
+    evaluate_policy,
+    should_show_recommended_notice,
+    update_notice,
+)
 from upstream_agent.version import __version__
 
 # Hard-coded camera/stream defaults sent to the backend — kept in sync
@@ -510,18 +517,19 @@ def _start_session(
     return client.start_stream_session(session_req)
 
 
-def _fetch_limits(
+def _fetch_bootstrap(
     client: UpstreamApiClient, on_event: EventCallback | None
-) -> BootstrapLimits | None:
-    """Best-effort bootstrap limits fetch. Never raises.
+) -> BootstrapResponse | None:
+    """Best-effort bootstrap fetch. Never raises.
 
-    ``None`` means "limits unknown" — the pre-check passes the local
-    config through and the server enforces, exactly as before bootstrap
-    existed.
+    ``None`` means "server unreachable" — limits stay unknown (the
+    pre-check passes the local config through and the server enforces,
+    exactly as before bootstrap existed) and no update notice is shown
+    (offline must change nothing).
     """
 
     try:
-        boot = client.get_bootstrap()
+        return client.get_bootstrap()
     except ApiError as exc:
         _emit(
             on_event,
@@ -530,7 +538,56 @@ def _fetch_limits(
             f"still enforces them): {_safe_message(exc)}",
         )
         return None
-    return boot.limits
+
+
+def _maybe_emit_update_notice(
+    boot: BootstrapResponse | None,
+    state: Any,
+    save_progress: Callable[[Any], None] | None,
+    on_event: EventCallback | None,
+) -> None:
+    """Update M2 (notify-only): surface the server's version policy as a
+    short startup notice. Never raises; never blocks; dev builds and
+    missing/offline policies are silent. RECOMMENDED notices are throttled
+    via ``state.last_update_notice_at`` (once per snooze window); a
+    below-minimum notice always shows (still notify-only in M2 — streaming
+    proceeds; refusal is the M3 milestone)."""
+
+    policy_msg = boot.agent_version_policy if boot is not None else None
+    policy = (
+        VersionPolicy(
+            latest_version=policy_msg.latest_version,
+            minimum_supported_version=policy_msg.minimum_supported_version,
+            severity_hint=policy_msg.severity_hint,
+            release_notes_url=policy_msg.release_notes_url,
+            install_hint=policy_msg.install_hint,
+        )
+        if policy_msg is not None
+        else None
+    )
+    status = evaluate_policy(__version__, policy)
+    if status in (
+        UpdateStatus.NO_POLICY,
+        UpdateStatus.UP_TO_DATE,
+        UpdateStatus.DEV_BUILD,
+    ):
+        logger.debug("update check: %s", status.value)
+        return
+    assert policy is not None
+    if status is UpdateStatus.UPDATE_RECOMMENDED:
+        last = getattr(state, "last_update_notice_at", None)
+        if not should_show_recommended_notice(last, time.time()):
+            logger.debug("update check: recommended notice snoozed")
+            return
+        try:
+            state.last_update_notice_at = time.time()
+            if save_progress is not None:
+                save_progress(state)
+        except Exception:  # snooze bookkeeping must never break startup
+            logger.debug("update check: could not persist notice timestamp")
+    notice = update_notice(__version__, policy, status)
+    if notice:
+        _emit(on_event, "update_notice", notice)
 
 
 def _report_blocked_by_limits(
@@ -1390,7 +1447,9 @@ def run_agent(  # noqa: PLR0912, PLR0915  (linear flow with explicit cleanup)
         # (disallowed source type / codec — nothing to clamp to) is fatal
         # and propagates after cleanup. The server re-validates everything
         # regardless; this just fails earlier with a friendlier message.
-        limits = _fetch_limits(client, on_event)
+        boot = _fetch_bootstrap(client, on_event)
+        limits = boot.limits if boot is not None else None
+        _maybe_emit_update_notice(boot, state, save_progress, on_event)
         planned = plan_stream_config(
             width=cfg.camera.requested_width,
             height=cfg.camera.requested_height,

@@ -5,6 +5,36 @@ top after every meaningful commit** using the format below. Tests,
 trivial typo fixes, and dependency bumps don't need their own entry —
 group them with the next substantive change.
 
+## 2026-06-12 - feat(update): notify-only version checking (update M2)
+
+**Why:** stale agents miss reliability/security fixes and new API
+contract expectations. First slice of the approved auto-update plan:
+server owns the version facts, the agent owns the comparison, nothing
+blocks and nothing self-updates.
+
+**What:** `upstream_agent/update_check.py` — dependency-free strict
+X.Y.Z parser, `evaluate_policy` (no_policy / up_to_date /
+update_recommended / update_required / dev_build), notice text builders,
+24h recommended-notice snooze helper. Bootstrap schema gains optional
+`agent_version_policy` (extra="ignore" keeps old/new servers
+compatible). The supervisor's existing best-effort bootstrap fetch
+(renamed `_fetch_bootstrap`) now also emits at most ONE `update_notice`
+event per run start — recommended tier throttled via the new
+`State.last_update_notice_at` (state field-set lock consciously
+widened), below-minimum always shown but STILL notify-only (streaming
+proceeds; refusal is M3). Interactive shell prints the same notice once
+per session after login/refresh. Dev builds (`X.Y.Z`-unparseable or
+`UPSTREAM_AGENT_DEV=1`) and offline runs are completely silent — offline
+behavior is byte-identical to before.
+
+**Tests:** tests/test_update_check.py (10): parser/ordering truth
+tables, dev detection, policy matrix, notice text, snooze window, and
+supervisor integration (one notice + still streams; silent when
+current/no-policy; snooze respected; offline unchanged). 431 passing.
+
+**Server counterpart:** upstream-api-server ships the policy on
+GET /v1/agents/bootstrap via five optional UPSTREAM_AGENT_* env settings.
+
 ## Format
 
 ```

@@ -61,6 +61,12 @@ from upstream_agent.logging_setup import RingBufferHandler, redact_token
 from upstream_agent.server_config import camera_config_from_server
 from upstream_agent.state import State, load_state, save_state
 from upstream_agent.supervisor import run_agent
+from upstream_agent.update_check import (
+    UpdateStatus,
+    VersionPolicy,
+    evaluate_policy,
+    update_notice,
+)
 from upstream_agent.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -137,6 +143,8 @@ class InteractiveShell:
             lambda base_url, token: UpstreamApiClient(base_url, token)
         )
         self._run_fn = run_fn
+        # Update M2: show the version notice at most once per shell session.
+        self._update_notice_shown = False
         self._input = input_fn
         self._password = password_fn
         self._console = console or Console()
@@ -250,7 +258,33 @@ class InteractiveShell:
             f"[bold {_G}]Connected to {account}[/] as token "
             f"[{_B}]{redact_token(token)}[/] (saved to [{_B}]{path}[/])."
         )
+        self._maybe_print_update_notice()
         self.cmd_status()
+
+    def _maybe_print_update_notice(self) -> None:
+        """Update M2 (notify-only): one short, dismissable notice per shell
+        session when the server's bootstrap policy says we're behind. Dev
+        builds / missing policy / offline are silent."""
+        if self._update_notice_shown or self._bootstrap is None:
+            return
+        msg = self._bootstrap.agent_version_policy
+        if msg is None:
+            return
+        policy = VersionPolicy(
+            latest_version=msg.latest_version,
+            minimum_supported_version=msg.minimum_supported_version,
+            severity_hint=msg.severity_hint,
+            release_notes_url=msg.release_notes_url,
+            install_hint=msg.install_hint,
+        )
+        status = evaluate_policy(__version__, policy)
+        notice = update_notice(__version__, policy, status)
+        if notice is None:
+            return
+        self._update_notice_shown = True
+        color = "red" if status is UpdateStatus.UPDATE_REQUIRED else _GOLD
+        for line in notice.splitlines():
+            self._console.print(f"[{color}]{line}[/]")
 
     def cmd_refresh(self) -> None:
         if not self._has_usable_token():
@@ -274,6 +308,7 @@ class InteractiveShell:
             self._console.print(f"[red]Server error:[/red] {exc}")
             return
         self._connected = True
+        self._maybe_print_update_notice()
 
     def cmd_status(self) -> None:
         boot = self._bootstrap

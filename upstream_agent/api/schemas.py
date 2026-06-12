@@ -422,6 +422,22 @@ class BootstrapSessionSummary(BaseModel):
     approved: dict[str, object] | None = None
 
 
+class AgentVersionPolicy(BaseModel):
+    """Server-owned version-policy facts (update M2, notify-only).
+
+    Optional everywhere: the server omits the whole object when no policy
+    is configured, and individual fields may be absent. The agent computes
+    the consequences locally (see ``upstream_agent.update_check``)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    latest_version: str | None = None
+    minimum_supported_version: str | None = None
+    severity_hint: str | None = None
+    release_notes_url: str | None = None
+    install_hint: str | None = None
+
+
 class BootstrapResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -433,6 +449,8 @@ class BootstrapResponse(BaseModel):
     cameras: list[Camera] = Field(default_factory=list)
     active_sessions: list[BootstrapSessionSummary] = Field(default_factory=list)
     server_time: str | None = None
+    # Update M2: optional server version policy (None on older servers).
+    agent_version_policy: AgentVersionPolicy | None = None
 
 
 # ---------------------------------------------------------------------------

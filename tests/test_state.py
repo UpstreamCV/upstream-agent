@@ -129,7 +129,14 @@ def test_save_state_writes_atomically_via_tmp_file(
 def test_state_schema_does_not_store_secrets() -> None:
     """Lock the field set so future edits can't accidentally add a token field."""
 
-    assert set(State.model_fields.keys()) == {"agent_id", "device_id", "last_camera_id"}
+    assert set(State.model_fields.keys()) == {
+        "agent_id",
+        "device_id",
+        "last_camera_id",
+        # Update M2: epoch-seconds of the last "update recommended" notice
+        # (a throttle timestamp — not a secret, not an identifier).
+        "last_update_notice_at",
+    }
 
 
 def test_state_schema_rejects_extra_fields() -> None:

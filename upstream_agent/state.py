@@ -39,6 +39,10 @@ class State(BaseModel):
     agent_id: str | None = None
     device_id: str = Field(..., min_length=1)
     last_camera_id: str | None = None
+    # Update M2: when the last "update recommended" notice was shown
+    # (epoch seconds) — throttles the reminder to once per snooze window.
+    # Required-update notices must never consult this.
+    last_update_notice_at: float | None = None
 
 
 def default_state_path() -> Path:
