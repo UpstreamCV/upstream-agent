@@ -32,6 +32,53 @@ Explain how this change affects the agent flow.
 
 ---
 
+## 2026-06-11 - docs: fix two stale 5 s cadence mentions + CI hardening
+
+### Summary
+Follow-up to the 5 s -> 15 s heartbeat change (157c46e). Review found
+two doc paragraphs that still said "5-second cadence"; both are now
+"15-second". The previous entry's test count was also wrong (claimed
+419 passed; the suite passes 421) and is corrected. The CI workflow
+gets standard hardening: a read-only token, a concurrency-cancel
+group, and push triggers scoped to `main` so in-repo PR branches no
+longer run every job twice (once for `push`, once for `pull_request`).
+
+### Files touched
+- `docs/api-contracts.md` — `POST /v1/heartbeats` section:
+  "5-second cadence" -> "15-second cadence".
+- `docs/architecture.md` — Milestone 6 "Runtime health" paragraph:
+  "5-second cadence" -> "15-second cadence".
+- `docs/commit-log.md` — 157c46e entry: test count corrected to
+  421 passed; correction note appended about the two doc stragglers.
+- `.github/workflows/ci.yml` — added `permissions: contents: read`;
+  added `concurrency` group `${{ github.workflow }}-${{ github.ref }}`
+  with `cancel-in-progress: true`; `push` now scoped to
+  `branches: [main]`.
+
+### Functions/classes changed
+- None — docs and CI configuration only.
+
+### System interaction notes
+No runtime behavior changes. CI behavior changes: pushes to
+non-`main` branches rely on the `pull_request` trigger (open a PR to
+get CI); superseded runs on the same ref are cancelled; the
+workflow's `GITHUB_TOKEN` can no longer write to the repo.
+
+### Testing/checks
+- `uv run pytest -q` — 421 passed.
+- Re-grepped the whole repo for remaining 5-second heartbeat
+  mentions; only unrelated constants (camera settle/validation
+  windows, FFmpeg stop timeout) and historical commit-log entries
+  remain.
+- Workflow YAML changes are declarative; verified against GitHub
+  Actions schema conventions, exercised on next push to `main`.
+
+### Follow-up TODOs
+- None beyond the existing CI matrix / lint TODOs in the previous
+  entry.
+
+---
+
 ## 2026-06-11 - ops: heartbeat interval 5 s -> 15 s + minimal CI workflow
 
 ### Summary
@@ -88,11 +135,16 @@ runtime keys off the heartbeat interval — supervisor fatal-reason
 polling is per-frame, not per-heartbeat.
 
 ### Testing/checks
-- `pytest -q` — 419 passed.
+- `pytest -q` — 421 passed.
 - Grepped code + tests + docs for remaining 5-second heartbeat
   assumptions; the only remaining "5 s" mentions are unrelated
   constants (camera validation window, FFmpeg stop timeout) and
   historical commit-log entries, which were left as written.
+- Correction (follow-up commit): the grep above missed two doc
+  stragglers — "5-second cadence" in `docs/api-contracts.md`
+  (`POST /v1/heartbeats` section) and in `docs/architecture.md`
+  (Milestone 6 "Runtime health" paragraph). Both fixed to 15-second
+  in the follow-up commit.
 - The workflow itself runs on the first push to GitHub; not
   executable locally.
 

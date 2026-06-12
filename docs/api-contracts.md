@@ -424,7 +424,7 @@ in heartbeat payloads.
 ### `POST /v1/heartbeats`
 
 Submit a batch of heartbeats for an agent. Called by `upstream run`
-on a 5-second cadence from a background thread while the stream is
+on a 15-second cadence from a background thread while the stream is
 active. The agent sends one heartbeat per call in Milestone 6;
 batching across multiple cameras or replaying offline-queued
 heartbeats is deferred to the M7 reconnect work.

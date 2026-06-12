@@ -300,7 +300,7 @@ existing `start`/`stop` pair is sufficient.
 
 ## Runtime health (Milestone 6)
 
-`upstream run` now reports liveness back to the API on a 5-second
+`upstream run` now reports liveness back to the API on a 15-second
 cadence so the dashboard can mark the camera/session online and
 show basic telemetry. Two new modules implement this:
 
