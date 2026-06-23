@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from upstream_agent.errors import ConfigError
 
@@ -68,6 +68,51 @@ class LoggingConfig(BaseModel):
     level: Literal["debug", "info", "warning", "error"] = "info"
 
 
+class CollectorConfig(BaseModel):
+    """Upstream Reliability local collector settings.
+
+    Every field has a safe default, so a config without a ``collector:``
+    section still yields a usable collector (disabled-by-default, startable
+    from the interactive shell). The collector reuses ``api`` for the cloud
+    token/base_url; it never needs a camera.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # ``enabled`` gates auto-start paths; the shell's explicit ``collector
+    # start`` command starts it regardless.
+    enabled: bool = False
+    # Bind localhost by default — the customer's CV app posts to 127.0.0.1.
+    host: str = Field(default="127.0.0.1", min_length=1)
+    port: int = Field(default=8756, ge=1, le=65535)
+    spool_dir: str = Field(default="~/.upstream/collector-spool", min_length=1)
+    flush_interval_seconds: float = Field(default=5.0, gt=0)
+    # Hard cap matches the cloud ingest contract (max 500 observations/batch).
+    max_batch_size: int = Field(default=500, ge=1, le=500)
+    max_spool_observations: int = Field(default=50_000, ge=1)
+    max_spool_bytes: int = Field(default=104_857_600, ge=1)  # 100 MiB
+    # Optional shared secret for the local receiver. Disabled by default
+    # (localhost trust). Never logged or exposed via /status.
+    inbound_token: str | None = None
+    # Cloud-visible health: the collector periodically uploads a safe
+    # ``collector_heartbeat`` observation (counters only) so the dashboard can
+    # show true status. ``source`` labels that heartbeat (defaults to the
+    # hostname at runtime); 0 disables the heartbeat.
+    heartbeat_interval_seconds: float = Field(default=60.0, ge=0)
+    source: str | None = None
+
+    @model_validator(mode="after")
+    def _require_token_off_localhost(self) -> CollectorConfig:
+        # Binding beyond loopback exposes the receiver to the local network;
+        # require an inbound token in that case so it isn't open by default.
+        loopback = {"127.0.0.1", "localhost", "::1"}
+        if self.host not in loopback and not self.inbound_token:
+            raise ValueError(
+                "inbound_token is required when collector.host is not a loopback address"
+            )
+        return self
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -75,6 +120,7 @@ class Config(BaseModel):
     camera: CameraConfig
     stream: StreamConfig = Field(default_factory=StreamConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    collector: CollectorConfig = Field(default_factory=CollectorConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +246,28 @@ stream:
 logging:
   # "debug" | "info" | "warning" | "error"
   level: "info"
+
+# Upstream Reliability local collector (optional). Your existing CV system
+# POSTs observations to http://127.0.0.1:8756/v1/observations; the collector
+# buffers and uploads them to Upstream Cloud. Start it from the `upstream`
+# shell with `collector start`. All fields below are optional and shown with
+# their defaults.
+collector:
+  enabled: false
+  host: "127.0.0.1"
+  port: 8756
+  spool_dir: "~/.upstream/collector-spool"
+  flush_interval_seconds: 5
+  max_batch_size: 500
+  max_spool_observations: 50000
+  max_spool_bytes: 104857600
+  # Optional shared secret required as X-Upstream-Collector-Token on inbound
+  # requests. Leave null for localhost trust.
+  inbound_token: null
+  # Cloud-visible collector health: upload a safe status heartbeat every N
+  # seconds (0 disables). `source` labels it (defaults to this host's name).
+  heartbeat_interval_seconds: 60
+  source: null
 """
 
 

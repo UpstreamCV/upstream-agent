@@ -43,6 +43,8 @@ from upstream_agent.api.schemas import (
     Heartbeat,
     HeartbeatBatchRequest,
     HeartbeatBatchResponse,
+    ObservationBatchRequest,
+    ObservationBatchResponse,
     Session,
     StopStreamSessionRequest,
     StopStreamSessionResponse,
@@ -85,6 +87,9 @@ STREAM_SESSION_STOP_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}/stop"
 STREAM_SESSION_GET_PATH_TEMPLATE: str = "/v1/stream-sessions/{session_id}"
 # Heartbeat endpoint takes ``agent_id`` as a query parameter, not a path part.
 HEARTBEAT_PATH: str = "/v1/heartbeats"
+# Upstream Reliability M1a ingest: the collector uploads buffered observation
+# batches here. Account is derived from the bearer token, never the body.
+RELIABILITY_OBSERVATIONS_PATH: str = "/v1/reliability/observations"
 
 # Stable error codes the backend returns inside the error envelope.
 TOKEN_REVOKED_ERROR_CODE: str = "token_revoked"
@@ -263,6 +268,24 @@ class UpstreamApiClient:
             body,
             HeartbeatBatchResponse,
             params={"agent_id": agent_id},
+        )
+
+    def upload_observations(
+        self, req: ObservationBatchRequest
+    ) -> ObservationBatchResponse:
+        """Upload one buffered observation batch to Upstream Cloud (M1a).
+
+        Errors are translated via the same typed
+        :class:`~upstream_agent.errors.ApiError` mapping as every other
+        endpoint; the collector's flusher decides whether to retry (transient)
+        or pause (fatal auth). The request body is never logged.
+        """
+
+        return self._request(
+            "POST",
+            RELIABILITY_OBSERVATIONS_PATH,
+            req,
+            ObservationBatchResponse,
         )
 
     # ------------------------------------------------------------------

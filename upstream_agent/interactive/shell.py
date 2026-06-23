@@ -44,6 +44,7 @@ from upstream_agent.branding import (
     BRAND_GREEN,
     logo_text,
 )
+from upstream_agent.collector import CollectorService
 from upstream_agent.config import Config, load_config, save_api_token
 from upstream_agent.diagnostics.api import (
     _agent_name_from,
@@ -111,6 +112,9 @@ _HELP_LINES: tuple[tuple[str, str], ...] = (
     ("streams", "Local stream workers and server-side active sessions"),
     ("start \\[camera]", "Start streaming a camera (default: first available)"),
     ("stop \\[camera]", "Stop a running stream"),
+    ("collector start", "Start the local collector (receive observations on localhost)"),
+    ("collector status", "Collector endpoint, spool, and upload counters"),
+    ("collector stop", "Stop the local collector"),
     ("logs \\[n]", "Show the last n log lines (default 50)"),
     ("login", "Enter / replace the API token"),
     ("refresh", "Re-fetch account status from the server"),
@@ -130,6 +134,7 @@ class InteractiveShell:
         ring: RingBufferHandler | None = None,
         registry: WorkerRegistry | None = None,
         client_factory: Callable[..., UpstreamApiClient] | None = None,
+        collector_factory: Callable[[Config], CollectorService] | None = None,
         run_fn: Callable[..., Any] = run_agent,
         input_fn: Callable[[str], str] = input,
         password_fn: Callable[[str], str] = getpass.getpass,
@@ -142,6 +147,10 @@ class InteractiveShell:
         self._client_factory = client_factory or (
             lambda base_url, token: UpstreamApiClient(base_url, token)
         )
+        self._collector_factory = collector_factory or (
+            lambda cfg: CollectorService.from_config(cfg, client_factory=self._client_factory)
+        )
+        self._collector: CollectorService | None = None
         self._run_fn = run_fn
         # Update M2: show the version notice at most once per shell session.
         self._update_notice_shown = False
@@ -369,6 +378,17 @@ class InteractiveShell:
                 detail = f" [{_B}]— {st.last_message}[/]" if st.last_message else ""
                 lines.append(f"  {st.name}: {_state_markup(st.state)}{detail}")
 
+        if self._collector is not None:
+            running = self._collector.is_running()
+            lines.append("")
+            state = f"[bold {_G}]running[/]" if running else f"[{_B}]stopped[/]"
+            lines.append(f"Collector: {state}")
+            if running:
+                collector_status = self._collector.status()
+                lines.append(
+                    f"  Local endpoint: [{_B}]{collector_status.local_endpoint}[/]"
+                )
+
         self._console.print(
             Panel(
                 "\n".join(lines),
@@ -560,6 +580,104 @@ class InteractiveShell:
         for line in lines:
             self._console.print(line, highlight=False, markup=False)
 
+    def cmd_collector(self, arg: str = "") -> None:
+        """Control the local Upstream Collector: ``collector start|stop|status``.
+
+        The collector receives observation batches from the customer's CV
+        system on ``http://127.0.0.1:8756/v1/observations`` and uploads them to
+        Upstream Cloud. It runs in the background; the prompt stays responsive.
+        """
+        sub = arg.strip().lower()
+        if sub == "start":
+            self._collector_start()
+        elif sub == "stop":
+            self._collector_stop()
+        elif sub == "status":
+            self._collector_status()
+        else:
+            self._console.print(
+                f"Usage: [bold {_G}]collector start[/] | "
+                f"[bold {_G}]collector status[/] | [bold {_G}]collector stop[/]"
+            )
+
+    def _ensure_collector(self) -> CollectorService | None:
+        if self._collector is not None:
+            return self._collector
+        if self._cfg is None:
+            return None
+        self._collector = self._collector_factory(self._cfg)
+        return self._collector
+
+    def _collector_start(self) -> None:
+        if not self._has_usable_token():
+            self._console.print(f"Not configured — type [bold {_G}]login[/] first.")
+            return
+        collector = self._ensure_collector()
+        if collector is None:
+            self._console.print(f"Not configured — type [bold {_G}]login[/] first.")
+            return
+        if collector.is_running():
+            st = collector.status()
+            self._console.print(
+                f"Collector is already running on [{_B}]{st.local_endpoint}[/]."
+            )
+            return
+        try:
+            collector.start()
+        except OSError:
+            # Don't surface the raw OS error string (may include host:port).
+            self._console.print(
+                "[red]Could not start collector[/red] — the address may be in use. "
+                "Check that another collector isn't already running."
+            )
+            return
+        st = collector.status()
+        endpoint = st.local_endpoint or ""
+        base = endpoint.removesuffix("/v1/observations")
+        last = st.last_upload_at or "never"
+        self._console.print(f"[bold {_G}]Collector running on {base}[/]")
+        self._console.print(f"Send observations to [{_B}]POST {endpoint}[/]")
+        self._console.print(f"Spool: [{_GOLD}]{st.spooled_observations}[/] queued")
+        self._console.print(f"Last upload: [{_B}]{last}[/]")
+
+    def _collector_stop(self) -> None:
+        collector = self._collector
+        if collector is None or not collector.is_running():
+            self._console.print("Collector is not running.")
+            return
+        self._console.print(f"[{_GOLD}]Stopping collector...[/]")
+        collector.stop()
+        self._console.print(f"[bold {_G}]Collector stopped.[/]")
+
+    def _collector_status(self) -> None:
+        collector = self._ensure_collector()
+        if collector is None:
+            self._console.print(f"Not configured — type [bold {_G}]login[/] first.")
+            return
+        st = collector.status()
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_row("Collector", "running" if st.running else "stopped")
+        table.add_row("Local endpoint", st.local_endpoint or "—")
+        table.add_row(
+            "Spooled",
+            f"{st.spooled_batches} batches / {st.spooled_observations} observations",
+        )
+        table.add_row(
+            "Uploaded",
+            f"{st.uploaded_batches} batches / {st.uploaded_observations} observations",
+        )
+        table.add_row(
+            "Dropped",
+            f"{st.dropped_batches} batches / {st.dropped_observations} observations",
+        )
+        table.add_row("Last upload", st.last_upload_at or "never")
+        table.add_row("Last error", st.last_error or "none")
+        table.add_row("Cloud reachable", "yes" if st.cloud_reachable else "no")
+        _style_kv_table(table)
+        self._console.print(
+            Panel(table, title=f"[bold {_G}]collector[/]", border_style=_G)
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -571,6 +689,9 @@ class InteractiveShell:
                 f"[{_GOLD}]Stopping {len(running)} stream(s) before exit...[/]"
             )
         self._registry.stop_all()
+        if self._collector is not None and self._collector.is_running():
+            self._console.print(f"[{_GOLD}]Stopping collector...[/]")
+            self._collector.stop()
         self._console.print(f"[bold {_G}]Bye.[/]")
         return 0
 

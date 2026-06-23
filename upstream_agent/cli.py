@@ -30,6 +30,7 @@ process exits with code 1.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import typer
@@ -534,3 +535,77 @@ def run_cmd(
         raise typer.Exit(code=1) from None
 
     save_state(updated_state, default_state_path())
+
+
+# Optional automation entrypoint. The PRIMARY UX is the interactive shell
+# (`upstream` → `collector start`); this headless `upstream collector start`
+# exists for systemd/scripts and does the same thing in the foreground.
+collector_app = typer.Typer(
+    name="collector",
+    help="Run the local Upstream Collector headless (prefer the interactive shell).",
+    no_args_is_help=True,
+)
+app.add_typer(collector_app, name="collector")
+
+
+@collector_app.command("start")
+def collector_start_cmd(
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Override the config file path (default: ~/.upstream/config.yaml).",
+    ),
+) -> None:
+    """Start the local collector in the foreground until Ctrl+C."""
+
+    config_path = resolve_config_path(config)
+    if not config_path.exists():
+        typer.echo(f"No config found at {config_path}.", err=True)
+        typer.echo("Run 'upstream init' to create one, then 'upstream login'.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        cfg = load_config(config_path, allow_placeholder=True)
+    except UpstreamError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    if cfg.api.is_placeholder_token:
+        typer.echo(
+            "Error: API token is still a placeholder. Edit "
+            f"{config_path} (api.token) and re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    sensitive = {cfg.api.token}
+    if cfg.collector.inbound_token:
+        sensitive.add(cfg.collector.inbound_token)
+    setup_logging(
+        level=cfg.logging.level,
+        log_dir=_default_log_dir(),
+        sensitive_values=sensitive,
+    )
+
+    # Imported lazily so other subcommands don't pay for it.
+    from upstream_agent.collector import CollectorService  # noqa: PLC0415
+
+    service = CollectorService.from_config(cfg)
+    try:
+        service.start()
+    except OSError:
+        # Never echo the raw OS error (may include host:port).
+        typer.echo(
+            "Error: could not start collector — the address may be in use.", err=True
+        )
+        raise typer.Exit(code=1) from None
+
+    endpoint = service.status().local_endpoint or ""
+    typer.echo(f"Collector running. Send observations to POST {endpoint}")
+    typer.echo("Press Ctrl+C to stop.")
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        typer.echo("Stopping collector...")
+        service.stop()
+        raise typer.Exit(code=0) from None

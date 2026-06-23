@@ -23,7 +23,7 @@ the full request/response specification.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -490,3 +490,51 @@ class CameraClaimResponse(BaseModel):
             if isinstance(inner, dict):
                 return inner
         return data
+
+
+# ---------------------------------------------------------------------------
+# Reliability observations (Upstream Collector → cloud ingest)
+# ---------------------------------------------------------------------------
+
+
+class ObservationItem(BaseModel):
+    """One observation in a collector batch.
+
+    Deliberately forgiving on customer input (``extra="ignore"``) so a stray
+    field never rejects otherwise-valid data — the cloud ingest applies the
+    same posture. The free-form ``payload`` carries whatever the customer's CV
+    system emits (event details, detection summaries, etc.); it is never
+    inspected or logged by the agent. ``type``, ``observed_at`` and ``payload``
+    are required; ``camera_id`` / ``external_camera_key`` are optional.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = Field(..., min_length=1, max_length=64)
+    observed_at: datetime
+    payload: dict[str, Any]
+    camera_id: str | None = None
+    external_camera_key: str | None = Field(default=None, max_length=256)
+
+
+class ObservationBatchRequest(BaseModel):
+    """Body of ``POST /v1/observations`` (local) and ``POST
+    /v1/reliability/observations`` (cloud). Forgiving on extras (relayed
+    customer data); the cloud derives the account from the bearer token, so no
+    ``account_id`` is ever sent."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    client_batch_id: str = Field(..., min_length=1, max_length=256)
+    source: str = Field(..., min_length=1, max_length=256)
+    observations: list[ObservationItem] = Field(..., min_length=1, max_length=500)
+
+
+class ObservationBatchResponse(BaseModel):
+    """Cloud response from ``POST /v1/reliability/observations`` (M1a)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    accepted: int
+    batch_id: str = Field(..., min_length=1)
+    server_time: datetime
