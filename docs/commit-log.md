@@ -5,6 +5,34 @@ top after every meaningful commit** using the format below. Tests,
 trivial typo fixes, and dependency bumps don't need their own entry —
 group them with the next substantive change.
 
+## 2026-10-27 - docs: update commit references after history rewrite
+
+### Summary
+`main` was rewritten to drop trailers from four commit messages ahead
+of the public release. File contents, authors, and dates are
+unchanged, and every commit up to and including `43e4e9e` kept its
+SHA. The six newest commits got new SHAs:
+
+| Old | New | Subject |
+| --- | --- | --- |
+| `8d671d1` | `87b78ef` | feat: interactive upstream shell + server-controlled stream config |
+| `020c0f7` | `b4397d1` | style: brand-themed interactive shell + logo on every launch |
+| `157c46e` | `8c7b1ec` | heartbeat: default interval 5s -> 15s; add CI workflow |
+| `db7ba2a` | `f327122` | docs+ci: fix two stale 5 s cadence mentions + CI hardening |
+| `23c8ab4` | `d428099` | feat(update): notify-only version checking (update M2) |
+| `2715b50` | `d340cd8` | feat(collector): M1b local Upstream Collector + M1c cloud heartbeat |
+
+Existing clones need `git fetch && git reset --hard origin/main`
+(after saving any local work); merging the old history back in would
+restore the old commits.
+
+### Files touched
+- `docs/commit-log.md` — this entry; the 2026-06-11 entry's two
+  references to `157c46e` now point at `8c7b1ec`.
+
+### Functions/classes changed
+- None — docs only.
+
 ## 2026-06-12 - feat(update): notify-only version checking (update M2)
 
 **Why:** stale agents miss reliability/security fixes and new API
@@ -65,7 +93,7 @@ Explain how this change affects the agent flow.
 ## 2026-06-11 - docs: fix two stale 5 s cadence mentions + CI hardening
 
 ### Summary
-Follow-up to the 5 s -> 15 s heartbeat change (157c46e). Review found
+Follow-up to the 5 s -> 15 s heartbeat change (8c7b1ec). Review found
 two doc paragraphs that still said "5-second cadence"; both are now
 "15-second". The previous entry's test count was also wrong (claimed
 419 passed; the suite passes 421) and is corrected. The CI workflow
@@ -78,7 +106,7 @@ longer run every job twice (once for `push`, once for `pull_request`).
   "5-second cadence" -> "15-second cadence".
 - `docs/architecture.md` — Milestone 6 "Runtime health" paragraph:
   "5-second cadence" -> "15-second cadence".
-- `docs/commit-log.md` — 157c46e entry: test count corrected to
+- `docs/commit-log.md` — 8c7b1ec entry: test count corrected to
   421 passed; correction note appended about the two doc stragglers.
 - `.github/workflows/ci.yml` — added `permissions: contents: read`;
   added `concurrency` group `${{ github.workflow }}-${{ github.ref }}`
